@@ -372,6 +372,37 @@ fn one_pass_mblk_neon(selfw: &[u64], rank: &[u64], out: &mut Vec<u64>) {
     one_pass_masks(selfw, rank, out, deposit_tiers_neon);
 }
 
+/// One pass word by word; at every 8th word the next 8 masks are checked and a
+/// run of 8 masks that are all 0 or all ones takes `s & m`. No fixed-length
+/// block for LLVM to unroll and SLP-vectorize, which cost 12 to 17 % on random
+/// masks in the blocked form
+fn one_pass_look(selfw: &[u64], rank: &[u64], out: &mut Vec<u64>) {
+    out.clear();
+    out.reserve(selfw.len());
+    let mut off = 0;
+    let mut i = 0;
+    let n = selfw.len();
+    while i < n {
+        if i % 8 == 0 && i + 8 <= n {
+            let b = &selfw[i..i + 8];
+            if b.iter().all(|&m| (m == 0) | (m == u64::MAX)) {
+                for &m in b {
+                    let k = m.count_ones() as usize;
+                    out.push(read_abs(rank, off, k) & m);
+                    off += k;
+                }
+                i += 8;
+                continue;
+            }
+        }
+        let m = selfw[i];
+        let k = m.count_ones();
+        out.push(deposit_tiers(read_abs(rank, off, k as usize), m, k));
+        off += k as usize;
+        i += 1;
+    }
+}
+
 fn two_pass<const SHLADD: bool>(selfw: &[u64], rank: &[u64], src: &mut Vec<u64>, out: &mut Vec<u64>) {
     let s8 = black_box(8u32);
     src.clear();
@@ -510,6 +541,7 @@ fn main() {
         run("one pass", &one_pass);
         run("+blocks", &one_pass_blk);
         run("+mask blocks", &one_pass_mblk);
+        run("+lookahead", &one_pass_look);
         #[cfg(target_arch = "aarch64")]
         run("+mask blocks neon", &one_pass_mblk_neon);
         let src_buf = std::cell::RefCell::new(Vec::new());
