@@ -403,6 +403,92 @@ fn one_pass_look(selfw: &[u64], rank: &[u64], out: &mut Vec<u64>) {
     }
 }
 
+/// SVE2 BITPERM `bdep`, second pass: a predicated loop over the source words
+/// of pass one, VL / 64 words per `bdep`, any vector length
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "sve2,sve2-bitperm")]
+unsafe fn bdep_slices(src: &[u64], mask: &[u64], out: &mut [u64]) {
+    let n = src.len();
+    unsafe {
+        core::arch::asm!(
+            "mov {i}, #0",
+            "whilelo p0.d, {i}, {n}",
+            "b.none 2f",
+            "1:",
+            "ld1d {{ z0.d }}, p0/z, [{s}, {i}, lsl #3]",
+            "ld1d {{ z1.d }}, p0/z, [{m}, {i}, lsl #3]",
+            "bdep z0.d, z0.d, z1.d",
+            "st1d {{ z0.d }}, p0, [{o}, {i}, lsl #3]",
+            "incd {i}",
+            "whilelo p0.d, {i}, {n}",
+            "b.first 1b",
+            "2:",
+            i = out(reg) _,
+            n = in(reg) n,
+            s = in(reg) src.as_ptr(),
+            m = in(reg) mask.as_ptr(),
+            o = in(reg) out.as_mut_ptr(),
+            out("v0") _,
+            out("v1") _,
+            out("p0") _,
+            options(nostack),
+        );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn two_pass_bdep(selfw: &[u64], rank: &[u64], src: &mut Vec<u64>, out: &mut Vec<u64>) {
+    src.clear();
+    let mut off = 0;
+    for &m in selfw {
+        let k = m.count_ones() as usize;
+        src.push(read_abs(rank, off, k));
+        off += k;
+    }
+    out.clear();
+    out.resize(selfw.len(), 0);
+    unsafe { bdep_slices(src, selfw, out) };
+}
+
+/// One word through `bdep`: in and out of the vector file per word
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "sve2,sve2-bitperm")]
+unsafe fn bdep1(s: u64, m: u64) -> u64 {
+    let r: u64;
+    unsafe {
+        core::arch::asm!(
+            "fmov d0, {s}",
+            "fmov d1, {m}",
+            "bdep z0.d, z0.d, z1.d",
+            "fmov {r}, d0",
+            s = in(reg) s,
+            m = in(reg) m,
+            r = lateout(reg) r,
+            out("v0") _,
+            out("v1") _,
+            options(pure, nomem, nostack),
+        );
+    }
+    r
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "sve2,sve2-bitperm")]
+unsafe fn one_pass_bdep_inner(selfw: &[u64], rank: &[u64], out: &mut Vec<u64>) {
+    out.clear();
+    let mut off = 0;
+    for &m in selfw {
+        let k = m.count_ones() as usize;
+        out.push(unsafe { bdep1(read_abs(rank, off, k), m) });
+        off += k;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn one_pass_bdep(selfw: &[u64], rank: &[u64], out: &mut Vec<u64>) {
+    unsafe { one_pass_bdep_inner(selfw, rank, out) }
+}
+
 fn two_pass<const SHLADD: bool>(selfw: &[u64], rank: &[u64], src: &mut Vec<u64>, out: &mut Vec<u64>) {
     let s8 = black_box(8u32);
     src.clear();
@@ -546,6 +632,11 @@ fn main() {
         run("+mask blocks neon", &one_pass_mblk_neon);
         let src_buf = std::cell::RefCell::new(Vec::new());
         run("two pass", &|s, r, o| two_pass::<false>(s, r, &mut src_buf.borrow_mut(), o));
+        #[cfg(target_arch = "aarch64")]
+        if std::arch::is_aarch64_feature_detected!("sve2-bitperm") {
+            run("bdep 1 pass", &one_pass_bdep);
+            run("bdep 2 pass", &|s, r, o| two_pass_bdep(s, r, &mut src_buf.borrow_mut(), o));
+        }
         #[cfg(target_feature = "bmi2")]
         run("pdep", &pdep);
         println!("{row}");
