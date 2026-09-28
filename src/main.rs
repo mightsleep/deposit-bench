@@ -6,7 +6,11 @@
 //! - two pass: first the source bits of every word (popcount, running offset,
 //!   absolute read), then the network over independent words in blocks of 8,
 //!   a block of trivial words copied; no tiers, so the compiler may vectorize
-//! - two pass, shl-add: the same with the byte prefix sums as three
+//! - one pass + blocks: one pass in blocks of 8 words, a block of trivial
+//!   words (source 0 or mask all ones) copied
+//! - one pass + blocks, neon: the same with the network in NEON byte lanes
+//!   (aarch64 only)
+//! - two pass, shl-add (the function remains, no longer timed): the same with the byte prefix sums as three
 //!   shift-adds instead of a multiply, which NEON lacks for 64-bit lanes
 //! - pdep: one pass, absolute reader, BMI2 (x86 builds with bmi2 only)
 //!
@@ -210,6 +214,164 @@ fn one_pass(selfw: &[u64], rank: &[u64], out: &mut Vec<u64>) {
     }
 }
 
+/// One pass in blocks of 8: sources and popcounts of the block first, a block
+/// of trivial words (source 0 or mask all ones, result = source) copied,
+/// otherwise the network with popcount tiers per word. `DEP` is the deposit
+/// used for a non-trivial word
+#[inline(always)]
+fn one_pass_blocks<F: Fn(u64, u64, u32) -> u64>(
+    selfw: &[u64],
+    rank: &[u64],
+    out: &mut Vec<u64>,
+    dep: F,
+) {
+    out.clear();
+    out.resize(selfw.len(), 0);
+    let mut off = 0;
+    let n8 = selfw.len() / 8 * 8;
+    for (o, m) in out[..n8].chunks_exact_mut(8).zip(selfw[..n8].chunks_exact(8)) {
+        let mut s = [0u64; 8];
+        let mut k = [0u32; 8];
+        let mut triv = true;
+        for j in 0..8 {
+            k[j] = m[j].count_ones();
+            s[j] = read_abs(rank, off, k[j] as usize);
+            off += k[j] as usize;
+            triv &= (s[j] == 0) | (m[j] == u64::MAX);
+        }
+        if triv {
+            o.copy_from_slice(&s);
+        } else {
+            for j in 0..8 {
+                o[j] = dep(s[j], m[j], k[j]);
+            }
+        }
+    }
+    for j in n8..selfw.len() {
+        let k = selfw[j].count_ones();
+        out[j] = dep(read_abs(rank, off, k as usize), selfw[j], k);
+        off += k as usize;
+    }
+}
+
+fn one_pass_blk(selfw: &[u64], rank: &[u64], out: &mut Vec<u64>) {
+    one_pass_blocks(selfw, rank, out, deposit_tiers);
+}
+
+/// The byte network in real byte lanes: NEON u8x8 shifts cannot cross into
+/// the next byte, so the masking constants of the SWAR form go away, and the
+/// byte popcounts are one `cnt`
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn expand_bytes_neon(source: u64, mask: u64) -> u64 {
+    use core::arch::aarch64::*;
+    unsafe {
+        let m0 = vcreate_u8(mask);
+        let mut m = m0;
+        let mut zeros = vmvn_u8(m0);
+        // round 1: parity = prefix xor of zeros, stride 1
+        let mut p = zeros;
+        p = veor_u8(p, vshl_n_u8::<1>(p));
+        p = veor_u8(p, vshl_n_u8::<2>(p));
+        p = veor_u8(p, vshl_n_u8::<4>(p));
+        let q = vand_u8(m, p);
+        let mv0 = vshr_n_u8::<1>(q);
+        m = veor_u8(veor_u8(m, q), mv0);
+        zeros = vbic_u8(zeros, p);
+        zeros = veor_u8(zeros, vshr_n_u8::<1>(zeros));
+        // round 2: stride 2
+        let mut p = zeros;
+        p = veor_u8(p, vshl_n_u8::<2>(p));
+        p = veor_u8(p, vshl_n_u8::<4>(p));
+        let q = vand_u8(m, p);
+        let mv1 = vshr_n_u8::<2>(q);
+        m = veor_u8(veor_u8(m, q), mv1);
+        zeros = vbic_u8(zeros, p);
+        zeros = veor_u8(zeros, vshr_n_u8::<2>(zeros));
+        // round 3: stride 4
+        let p = veor_u8(zeros, vshl_n_u8::<4>(zeros));
+        let q = vand_u8(m, p);
+        let mv2 = vshr_n_u8::<4>(q);
+        m = veor_u8(veor_u8(m, q), mv2);
+        // byte offsets: counts by `cnt`, prefix by one multiply
+        let kept = vget_lane_u64::<0>(vreinterpret_u64_u8(vcnt_u8(m0)));
+        let below = kept.wrapping_mul(bytes(1)) << 8;
+        let mut x = 0;
+        for j in 0..8 {
+            x |= ((source >> ((below >> (8 * j)) & 0xFF)) & 0xFF) << (8 * j);
+        }
+        let mut xv = vand_u8(vcreate_u8(x), m);
+        xv = vorr_u8(vbic_u8(xv, mv2), vshl_n_u8::<4>(vand_u8(xv, mv2)));
+        xv = vorr_u8(vbic_u8(xv, mv1), vshl_n_u8::<2>(vand_u8(xv, mv1)));
+        xv = vorr_u8(vbic_u8(xv, mv0), vshl_n_u8::<1>(vand_u8(xv, mv0)));
+        vget_lane_u64::<0>(vreinterpret_u64_u8(vand_u8(xv, m0)))
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn deposit_tiers_neon(source: u64, mask: u64, k: u32) -> u64 {
+    if k <= 2 || k >= 62 {
+        deposit_tiers(source, mask, k)
+    } else {
+        expand_bytes_neon(source, mask)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn one_pass_blk_neon(selfw: &[u64], rank: &[u64], out: &mut Vec<u64>) {
+    one_pass_blocks(selfw, rank, out, deposit_tiers_neon);
+}
+
+/// One pass, the shortcut decided from the masks alone: a block of 8 whose
+/// masks are all 0 or all ones takes `s & m`; any other block is exactly the
+/// plain one pass, nothing staged
+#[inline(always)]
+fn one_pass_masks<F: Fn(u64, u64, u32) -> u64>(
+    selfw: &[u64],
+    rank: &[u64],
+    out: &mut Vec<u64>,
+    dep: F,
+) {
+    out.clear();
+    out.resize(selfw.len(), 0);
+    let mut off = 0;
+    let n8 = selfw.len() / 8 * 8;
+    for (o, m) in out[..n8].chunks_exact_mut(8).zip(selfw[..n8].chunks_exact(8)) {
+        let mut triv = true;
+        for j in 0..8 {
+            triv &= (m[j] == 0) | (m[j] == u64::MAX);
+        }
+        if triv {
+            for j in 0..8 {
+                let k = m[j].count_ones() as usize;
+                o[j] = read_abs(rank, off, k) & m[j];
+                off += k;
+            }
+        } else {
+            for j in 0..8 {
+                let k = m[j].count_ones();
+                o[j] = dep(read_abs(rank, off, k as usize), m[j], k);
+                off += k as usize;
+            }
+        }
+    }
+    for j in n8..selfw.len() {
+        let k = selfw[j].count_ones();
+        out[j] = dep(read_abs(rank, off, k as usize), selfw[j], k);
+        off += k as usize;
+    }
+}
+
+fn one_pass_mblk(selfw: &[u64], rank: &[u64], out: &mut Vec<u64>) {
+    one_pass_masks(selfw, rank, out, deposit_tiers);
+}
+
+#[cfg(target_arch = "aarch64")]
+fn one_pass_mblk_neon(selfw: &[u64], rank: &[u64], out: &mut Vec<u64>) {
+    one_pass_masks(selfw, rank, out, deposit_tiers_neon);
+}
+
 fn two_pass<const SHLADD: bool>(selfw: &[u64], rank: &[u64], src: &mut Vec<u64>, out: &mut Vec<u64>) {
     let s8 = black_box(8u32);
     src.clear();
@@ -334,36 +496,26 @@ fn main() {
             rank[l - 1] &= low(total % 64);
         }
         rank.extend([0, 0]);
-        let (mut a, mut b, mut c, mut e, mut src) = (vec![], vec![], vec![], vec![], vec![]);
+        let mut a = vec![];
         vortex(selfw, rank, &mut a);
-        one_pass(selfw, rank, &mut b);
-        two_pass::<false>(selfw, rank, &mut src, &mut c);
-        two_pass::<true>(selfw, rank, &mut src, &mut e);
-        assert_eq!(a, b, "{name}");
-        assert_eq!(a, c, "{name}");
-        assert_eq!(a, e, "{name}");
         let ta = time(N, || vortex(black_box(selfw), black_box(rank), &mut a));
-        let tb = time(N, || one_pass(black_box(selfw), black_box(rank), &mut b));
-        let tc = time(N, || {
-            two_pass::<false>(black_box(selfw), black_box(rank), &mut src, &mut c)
-        });
-        let te = time(N, || {
-            two_pass::<true>(black_box(selfw), black_box(rank), &mut src, &mut e)
-        });
-        #[cfg(target_feature = "bmi2")]
-        let td = {
-            let mut d = vec![];
-            pdep(selfw, rank, &mut d);
-            assert_eq!(a, d);
-            time(N, || pdep(black_box(selfw), black_box(rank), &mut d))
+        let mut row = format!("  {name:<26} vortex {ta:6.2}");
+        let mut run = |label: &str, f: &dyn Fn(&[u64], &[u64], &mut Vec<u64>)| {
+            let mut o = vec![];
+            f(selfw, rank, &mut o);
+            assert_eq!(a, o, "{label} {name}");
+            let t = time(N, || f(black_box(selfw), black_box(rank), &mut o));
+            row += &format!(" | {label} {t:5.2} (x{:5.2})", ta / t);
         };
-        #[cfg(not(target_feature = "bmi2"))]
-        let td = f64::NAN;
-        println!(
-            "  {name:<26} vortex {ta:6.2} | one pass {tb:5.2} (x{:5.2}) | two pass mul {tc:5.2} (x{:5.2}) | two pass shl-add {te:5.2} (x{:5.2}) | pdep {td:5.2}",
-            ta / tb,
-            ta / tc,
-            ta / te
-        );
+        run("one pass", &one_pass);
+        run("+blocks", &one_pass_blk);
+        run("+mask blocks", &one_pass_mblk);
+        #[cfg(target_arch = "aarch64")]
+        run("+mask blocks neon", &one_pass_mblk_neon);
+        let src_buf = std::cell::RefCell::new(Vec::new());
+        run("two pass", &|s, r, o| two_pass::<false>(s, r, &mut src_buf.borrow_mut(), o));
+        #[cfg(target_feature = "bmi2")]
+        run("pdep", &pdep);
+        println!("{row}");
     }
 }
