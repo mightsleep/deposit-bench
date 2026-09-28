@@ -229,7 +229,10 @@ fn one_pass_blocks<F: Fn(u64, u64, u32) -> u64>(
     out.resize(selfw.len(), 0);
     let mut off = 0;
     let n8 = selfw.len() / 8 * 8;
-    for (o, m) in out[..n8].chunks_exact_mut(8).zip(selfw[..n8].chunks_exact(8)) {
+    for (o, m) in out[..n8]
+        .chunks_exact_mut(8)
+        .zip(selfw[..n8].chunks_exact(8))
+    {
         let mut s = [0u64; 8];
         let mut k = [0u32; 8];
         let mut triv = true;
@@ -337,7 +340,10 @@ fn one_pass_masks<F: Fn(u64, u64, u32) -> u64>(
     out.resize(selfw.len(), 0);
     let mut off = 0;
     let n8 = selfw.len() / 8 * 8;
-    for (o, m) in out[..n8].chunks_exact_mut(8).zip(selfw[..n8].chunks_exact(8)) {
+    for (o, m) in out[..n8]
+        .chunks_exact_mut(8)
+        .zip(selfw[..n8].chunks_exact(8))
+    {
         let mut triv = true;
         for j in 0..8 {
             triv &= (m[j] == 0) | (m[j] == u64::MAX);
@@ -489,7 +495,12 @@ fn one_pass_bdep(selfw: &[u64], rank: &[u64], out: &mut Vec<u64>) {
     unsafe { one_pass_bdep_inner(selfw, rank, out) }
 }
 
-fn two_pass<const SHLADD: bool>(selfw: &[u64], rank: &[u64], src: &mut Vec<u64>, out: &mut Vec<u64>) {
+fn two_pass<const SHLADD: bool>(
+    selfw: &[u64],
+    rank: &[u64],
+    src: &mut Vec<u64>,
+    out: &mut Vec<u64>,
+) {
     let s8 = black_box(8u32);
     src.clear();
     let mut off = 0;
@@ -531,6 +542,101 @@ fn block8<const SHLADD: bool>(s: &[u64; 8], m: &[u64; 8], s8: u32) -> [u64; 8] {
         o[j] = expand_bytes::<SHLADD>(s[j], m[j], s8);
     }
     o
+}
+
+/// Whole-word expand, Hacker's Delight 7-5: the compress move masks of six
+/// rounds, applied backwards with left shifts. Each round needs the prefix
+/// xor of `mk`, which is a carry-less multiply by all ones; `prefix` does it
+#[inline(always)]
+fn expand_hd<P: Fn(u64) -> u64>(x: u64, mask: u64, prefix: P) -> u64 {
+    let mut m = mask;
+    let mut mk = !mask << 1;
+    let mut mv = [0u64; 6];
+    for (i, v) in mv.iter_mut().enumerate() {
+        let mp = prefix(mk);
+        *v = mp & m;
+        m = (m ^ *v) | (*v >> (1 << i));
+        mk &= !mp;
+    }
+    let mut x = x;
+    for i in (0..6).rev() {
+        let v = mv[i];
+        x = (x & !v) | ((x << (1 << i)) & v);
+    }
+    x & mask
+}
+
+#[inline(always)]
+fn prefix_xor_soft(x: u64) -> u64 {
+    let mut p = x ^ (x << 1);
+    p ^= p << 2;
+    p ^= p << 4;
+    p ^= p << 8;
+    p ^= p << 16;
+    p ^ (p << 32)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn prefix_xor_clmul(x: u64) -> u64 {
+    // low half of x * (all ones) over GF(2)
+    unsafe { core::arch::aarch64::vmull_p64(x, u64::MAX) as u64 }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn prefix_xor_clmul(x: u64) -> u64 {
+    use core::arch::x86_64::*;
+    unsafe {
+        let p = _mm_clmulepi64_si128(_mm_cvtsi64_si128(x as i64), _mm_set1_epi64x(-1), 0);
+        _mm_cvtsi128_si64(p) as u64
+    }
+}
+
+#[inline(always)]
+fn tiers_with<E: Fn(u64, u64) -> u64>(source: u64, mask: u64, k: u32, e: E) -> u64 {
+    if k <= 2 || k >= 62 {
+        deposit_tiers(source, mask, k)
+    } else {
+        e(source, mask)
+    }
+}
+
+fn one_pass_hd_soft(selfw: &[u64], rank: &[u64], out: &mut Vec<u64>) {
+    out.clear();
+    let mut off = 0;
+    for &m in selfw {
+        let k = m.count_ones();
+        let s = read_abs(rank, off, k as usize);
+        out.push(tiers_with(s, m, k, |s, m| expand_hd(s, m, prefix_xor_soft)));
+        off += k as usize;
+    }
+}
+
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "aes"))]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "pclmulqdq,popcnt"))]
+unsafe fn one_pass_hd_clmul_inner(selfw: &[u64], rank: &[u64], out: &mut Vec<u64>) {
+    out.clear();
+    let mut off = 0;
+    for &m in selfw {
+        let k = m.count_ones();
+        let s = read_abs(rank, off, k as usize);
+        out.push(tiers_with(s, m, k, |s, m| {
+            expand_hd(s, m, |x| unsafe { prefix_xor_clmul(x) })
+        }));
+        off += k as usize;
+    }
+}
+
+fn one_pass_hd_clmul(selfw: &[u64], rank: &[u64], out: &mut Vec<u64>) {
+    unsafe { one_pass_hd_clmul_inner(selfw, rank, out) }
+}
+
+fn has_clmul() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    return std::arch::is_aarch64_feature_detected!("pmull");
+    #[cfg(target_arch = "x86_64")]
+    return is_x86_feature_detected!("pclmulqdq") && is_x86_feature_detected!("popcnt");
 }
 
 #[cfg(target_feature = "bmi2")]
@@ -628,14 +734,22 @@ fn main() {
         run("+blocks", &one_pass_blk);
         run("+mask blocks", &one_pass_mblk);
         run("+lookahead", &one_pass_look);
+        run("hd soft", &one_pass_hd_soft);
+        if has_clmul() {
+            run("hd clmul", &one_pass_hd_clmul);
+        }
         #[cfg(target_arch = "aarch64")]
         run("+mask blocks neon", &one_pass_mblk_neon);
         let src_buf = std::cell::RefCell::new(Vec::new());
-        run("two pass", &|s, r, o| two_pass::<false>(s, r, &mut src_buf.borrow_mut(), o));
+        run("two pass", &|s, r, o| {
+            two_pass::<false>(s, r, &mut src_buf.borrow_mut(), o)
+        });
         #[cfg(target_arch = "aarch64")]
         if std::arch::is_aarch64_feature_detected!("sve2-bitperm") {
             run("bdep 1 pass", &one_pass_bdep);
-            run("bdep 2 pass", &|s, r, o| two_pass_bdep(s, r, &mut src_buf.borrow_mut(), o));
+            run("bdep 2 pass", &|s, r, o| {
+                two_pass_bdep(s, r, &mut src_buf.borrow_mut(), o)
+            });
         }
         #[cfg(target_feature = "bmi2")]
         run("pdep", &pdep);

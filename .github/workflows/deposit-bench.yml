@@ -9,14 +9,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04-arm, ubuntu-latest]
+        runner: [ubuntu-24.04-arm, ubuntu-latest, macos-15]
     runs-on: ${{ matrix.runner }}
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
     - name: CPU
-      run: lscpu | grep -E "Model name|Architecture|Flags" | cut -c1-400
+      run: |
+        if command -v lscpu > /dev/null; then
+          lscpu | grep -E "Model name|Architecture|Flags" | cut -c1-400
+        else
+          echo "Model name: $(sysctl -n machdep.cpu.brand_string)"
+          sysctl hw.optional | grep -E "arm\.FEAT_(PMULL|SVE|BF16|I8MM)" || true
+        fi
     # the same source three ways: default target, LLVM vectorizers off (the
     # scalar baseline), and target-cpu=native; each run twice
     - name: bench
