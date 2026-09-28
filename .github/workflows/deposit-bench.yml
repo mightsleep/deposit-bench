@@ -1,0 +1,36 @@
+name: deposit-bench
+"on":
+  push: {}
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04-arm, ubuntu-latest]
+    runs-on: ${{ matrix.runner }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: CPU
+      run: lscpu | grep -E "Model name|Architecture|Flags" | cut -c1-400
+    # the same source three ways: default target, LLVM vectorizers off (the
+    # scalar baseline), and target-cpu=native; each run twice
+    - name: bench
+      run: |
+        set -euo pipefail
+        rustc --version
+        build() {
+          CARGO_TARGET_DIR=target/$1 RUSTFLAGS="$2" cargo build --release -q
+        }
+        build default ""
+        build novec "-C llvm-args=-vectorize-loops=false -C llvm-args=-vectorize-slp=false"
+        build native "-C target-cpu=native"
+        for run in 1 2; do
+          for b in default novec native; do
+            LABEL="$b run $run" target/$b/release/deposit-bench
+          done
+        done
