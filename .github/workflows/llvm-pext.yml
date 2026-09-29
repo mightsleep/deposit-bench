@@ -31,14 +31,7 @@ jobs:
     # old_* and new_* come from llc before and after the expandPEXT change,
     # built for this target; ext64 and dep64 are Rust core on this runner
     - name: bench
-      working-directory: llvm-pext
       run: |
-        set -euo pipefail
         rustc --version
-        rustc -O -C panic=abort core.rs -o libcore_bits.a
-        libs=""
-        if [ "$(uname)" = Linux ]; then libs="-lpthread -ldl"; fi
-        # shellcheck disable=SC2086 # libs is a word list
-        cc -O2 bench.c obj/${{ matrix.obj }}/old.o obj/${{ matrix.obj }}/new.o obj/${{ matrix.obj }}/stg.o libcore_bits.a $libs -o bench
-        ./bench
-        ./bench
+        sh llvm-pext/run.sh
+        sh llvm-pext/run.sh

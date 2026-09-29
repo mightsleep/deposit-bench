@@ -1,1 +1,3 @@
 /target
+llvm-pext/libcore_bits.a
+llvm-pext/bench

@@ -1,5 +1,6 @@
 // llvm.pext / llvm.pdep expansion: today's (old_*), the bytewise one (new_*) and the
-// staged one (stg_*), and Rust core's extract_bits / deposit_bits; objects from llc.
+// staged one (stg_*), and Rust core's extract_bits / deposit_bits unless built with
+// -DNO_RUST; objects from llc before and after the change.
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,7 +10,9 @@
   old_pdep##w(uint##w##_t, uint##w##_t), new_pdep##w(uint##w##_t, uint##w##_t), \
   stg_pext##w(uint##w##_t, uint##w##_t), stg_pdep##w(uint##w##_t, uint##w##_t);
 DECL(8) DECL(16) DECL(32) DECL(64)
+#ifndef NO_RUST
 uint64_t ext64(uint64_t, uint64_t), dep64(uint64_t, uint64_t);
+#endif
 
 static uint64_t ref_pext(uint64_t v, uint64_t m) {
   uint64_t r = 0; int k = 0;
@@ -46,7 +49,9 @@ static long check(void) {
     bad += stg_pext16(v, m16) != ref_pext((uint16_t)v, m16) || stg_pdep16(v, m16) != (uint16_t)ref_pdep(v, m16);
     bad += stg_pext32(v, m32) != ref_pext((uint32_t)v, m32) || stg_pdep32(v, m32) != (uint32_t)ref_pdep(v, m32);
     bad += stg_pext64(v, m) != ref_pext(v, m) || stg_pdep64(v, m) != ref_pdep(v, m);
+#ifndef NO_RUST
     bad += ext64(v, m) != ref_pext(v, m) || dep64(v, m) != ref_pdep(v, m);
+#endif
   }
   return bad;
 }
@@ -61,10 +66,16 @@ int main(void) {
   printf("correctness: %ld bad\n", bad);
   if (bad) return 1;
   for (int i = 0; i < N; i++) V[i] = rnd(), M[i] = rnd();
+#ifndef NO_RUST
   F f[] = {old_pext64, new_pext64, stg_pext64, ext64, old_pdep64, new_pdep64, stg_pdep64, dep64};
   const char *n[] = {"pext llvm now", "pext bytewise", "pext staged", "pext rust core",
                      "pdep llvm now", "pdep bytewise", "pdep staged", "pdep rust core"};
-  enum { K = 8 };
+#else
+  F f[] = {old_pext64, new_pext64, stg_pext64, old_pdep64, new_pdep64, stg_pdep64};
+  const char *n[] = {"pext llvm now", "pext bytewise", "pext staged",
+                     "pdep llvm now", "pdep bytewise", "pdep staged"};
+#endif
+  enum { K = sizeof f / sizeof f[0] };
   double bt[K], bl[K];
   for (int j = 0; j < K; j++) bt[j] = bl[j] = 1e18;
   // interleaved rounds, fastest of each: independent calls, then a chain
