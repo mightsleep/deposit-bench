@@ -1,0 +1,43 @@
+name: llvm-pext
+"on":
+  push:
+    paths: [llvm-pext/**, .github/workflows/llvm-pext.yml]
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04-arm, obj: linux }
+          - { runner: macos-15, obj: mac }
+    runs-on: ${{ matrix.runner }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # nightly
+      with:
+        toolchain: nightly
+    - name: CPU
+      run: |
+        if command -v lscpu > /dev/null; then
+          lscpu | grep -E "Model name|Architecture|Flags" | cut -c1-400
+        else
+          echo "Model name: $(sysctl -n machdep.cpu.brand_string)"
+        fi
+    # old_* and new_* come from llc before and after the expandPEXT change,
+    # built for this target; ext64 and dep64 are Rust core on this runner
+    - name: bench
+      working-directory: llvm-pext
+      run: |
+        set -euo pipefail
+        rustc --version
+        rustc -O -C panic=abort core.rs -o libcore_bits.a
+        libs=()
+        if [ "$(uname)" = Linux ]; then libs=(-lpthread -ldl); fi
+        cc -O2 bench.c obj/${{ matrix.obj }}/old.o obj/${{ matrix.obj }}/new.o obj/${{ matrix.obj }}/stg.o libcore_bits.a "${libs[@]}" -o bench
+        ./bench
+        ./bench

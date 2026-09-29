@@ -1,6 +1,7 @@
 name: deposit-bench
 "on":
-  push: {}
+  push:
+    paths-ignore: [llvm-pext/**, .github/workflows/llvm-pext.yml]
   workflow_dispatch: {}
 permissions:
   contents: read
