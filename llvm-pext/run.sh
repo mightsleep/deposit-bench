@@ -19,9 +19,9 @@ if rustc -O -C panic=abort core.rs -o libcore_bits.a 2> /dev/null; then
 fi
 # shellcheck disable=SC2086 # libs is a word list
 if [ -n "$rust" ]; then
-  cc -O2 bench.c "$obj/old.o" "$obj/new.o" "$obj/stg.o" "$rust" $libs -o bench
+  cc -O2 bench.c "$obj/old.o" "$obj/aes.o" "$obj/new.o" "$obj/stg.o" "$rust" $libs -o bench
 else
-  cc -O2 -DNO_RUST bench.c "$obj/old.o" "$obj/new.o" "$obj/stg.o" $libs -o bench
+  cc -O2 -DNO_RUST bench.c "$obj/old.o" "$obj/aes.o" "$obj/new.o" "$obj/stg.o" $libs -o bench
 fi
 if [ "$(uname -s)" = Darwin ]; then sysctl -n machdep.cpu.brand_string; else grep -m1 -i "model name\|CPU part" /proc/cpuinfo || true; fi
 ./bench

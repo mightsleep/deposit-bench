@@ -1,15 +1,15 @@
-// llvm.pext / llvm.pdep expansion: today's (old_*), the bytewise one (new_*) and the
-// staged one (stg_*), and Rust core's extract_bits / deposit_bits unless built with
+// llvm.pext / llvm.pdep expansion: today's without AES (old_*) and with it, so
+// with PMULL for CLMUL (aes_*), the bytewise one (new_*) and the staged one
+// (stg_*), and Rust core's extract_bits / deposit_bits unless built with
 // -DNO_RUST; objects from llc before and after the change.
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 
-#define DECL(w) uint##w##_t old_pext##w(uint##w##_t, uint##w##_t), new_pext##w(uint##w##_t, uint##w##_t), \
-  old_pdep##w(uint##w##_t, uint##w##_t), new_pdep##w(uint##w##_t, uint##w##_t), \
-  stg_pext##w(uint##w##_t, uint##w##_t), stg_pdep##w(uint##w##_t, uint##w##_t);
-DECL(8) DECL(16) DECL(32) DECL(64)
+#define DECL1(p, w) uint##w##_t p##_pext##w(uint##w##_t, uint##w##_t), p##_pdep##w(uint##w##_t, uint##w##_t);
+#define DECL(p) DECL1(p, 8) DECL1(p, 16) DECL1(p, 32) DECL1(p, 64)
+DECL(old) DECL(aes) DECL(new) DECL(stg)
 #ifndef NO_RUST
 uint64_t ext64(uint64_t, uint64_t), dep64(uint64_t, uint64_t);
 #endif
@@ -32,23 +32,25 @@ static uint64_t mask(void) {
     case 3: m = ~(1ULL << (rnd() & 63)); break; case 4: m = 1ULL << (rnd() & 63); break; }
   return m;
 }
+
+#define CHECK8(p) \
+  bad += p##_pext8(v, m) != ref_pext(v, m) || p##_pdep8(v, m) != (uint8_t)ref_pdep(v, m);
+#define CHECK(p) \
+  bad += p##_pext16(v, m16) != ref_pext((uint16_t)v, m16) || p##_pdep16(v, m16) != (uint16_t)ref_pdep(v, m16); \
+  bad += p##_pext32(v, m32) != ref_pext((uint32_t)v, m32) || p##_pdep32(v, m32) != (uint32_t)ref_pdep(v, m32); \
+  bad += p##_pext64(v, m) != ref_pext(v, m) || p##_pdep64(v, m) != ref_pdep(v, m);
+
 static long check(void) {
   long bad = 0;
   for (unsigned v = 0; v < 256; v++) for (unsigned m = 0; m < 256; m++) {
-    bad += new_pext8(v, m) != ref_pext(v, m) || old_pext8(v, m) != ref_pext(v, m);
-    bad += new_pdep8(v, m) != (uint8_t)ref_pdep(v, m) || old_pdep8(v, m) != (uint8_t)ref_pdep(v, m);
+    CHECK8(old) CHECK8(aes) CHECK8(new) CHECK8(stg)
   }
   for (long i = 0; i < 2000000; i++) {
     uint64_t v = rnd(), m = mask();
     if (i % 7 == 0) m = 0;
     if (i % 11 == 0) m = ~0ULL;
     uint16_t m16 = m; uint32_t m32 = m;
-    bad += new_pext16(v, m16) != ref_pext((uint16_t)v, m16) || new_pdep16(v, m16) != (uint16_t)ref_pdep(v, m16);
-    bad += new_pext32(v, m32) != ref_pext((uint32_t)v, m32) || new_pdep32(v, m32) != (uint32_t)ref_pdep(v, m32);
-    bad += new_pext64(v, m) != ref_pext(v, m) || new_pdep64(v, m) != ref_pdep(v, m);
-    bad += stg_pext16(v, m16) != ref_pext((uint16_t)v, m16) || stg_pdep16(v, m16) != (uint16_t)ref_pdep(v, m16);
-    bad += stg_pext32(v, m32) != ref_pext((uint32_t)v, m32) || stg_pdep32(v, m32) != (uint32_t)ref_pdep(v, m32);
-    bad += stg_pext64(v, m) != ref_pext(v, m) || stg_pdep64(v, m) != ref_pdep(v, m);
+    CHECK(old) CHECK(aes) CHECK(new) CHECK(stg)
 #ifndef NO_RUST
     bad += ext64(v, m) != ref_pext(v, m) || dep64(v, m) != ref_pdep(v, m);
 #endif
@@ -66,15 +68,24 @@ int main(void) {
   printf("correctness: %ld bad\n", bad);
   if (bad) return 1;
   for (int i = 0; i < N; i++) V[i] = rnd(), M[i] = rnd();
+  F f[] = {old_pext64, aes_pext64, new_pext64, stg_pext64,
 #ifndef NO_RUST
-  F f[] = {old_pext64, new_pext64, stg_pext64, ext64, old_pdep64, new_pdep64, stg_pdep64, dep64};
-  const char *n[] = {"pext llvm now", "pext bytewise", "pext staged", "pext rust core",
-                     "pdep llvm now", "pdep bytewise", "pdep staged", "pdep rust core"};
-#else
-  F f[] = {old_pext64, new_pext64, stg_pext64, old_pdep64, new_pdep64, stg_pdep64};
-  const char *n[] = {"pext llvm now", "pext bytewise", "pext staged",
-                     "pdep llvm now", "pdep bytewise", "pdep staged"};
+           ext64,
 #endif
+           old_pdep64, aes_pdep64, new_pdep64, stg_pdep64,
+#ifndef NO_RUST
+           dep64,
+#endif
+  };
+  const char *n[] = {"pext now", "pext now +aes", "pext bytewise", "pext staged",
+#ifndef NO_RUST
+                     "pext rust core",
+#endif
+                     "pdep now", "pdep now +aes", "pdep bytewise", "pdep staged",
+#ifndef NO_RUST
+                     "pdep rust core",
+#endif
+  };
   enum { K = sizeof f / sizeof f[0] };
   double bt[K], bl[K];
   for (int j = 0; j < K; j++) bt[j] = bl[j] = 1e18;

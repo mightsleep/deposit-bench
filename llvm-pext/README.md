@@ -8,6 +8,7 @@ so only a C compiler is needed:
     sh deposit-bench/llvm-pext/run.sh
 
 It first checks every function against a reference loop, then prints ns per call
-for random 64-bit masks: `llvm now` is today's expansion, `bytewise` and `staged`
-the two proposed ones (the change picks `bytewise` on Apple cores and `staged`
-on other AArch64 cores). A Rust core row appears when `rustc` is a nightly.
+for random 64-bit masks: `now` is today's expansion, `now +aes` the same with AES,
+which gives CLMUL through PMULL (every Apple core has it, most server cores too),
+and `bytewise` and `staged` the two proposed forms. A Rust core row appears
+when `rustc` is a nightly.
