@@ -36,8 +36,9 @@ jobs:
         set -euo pipefail
         rustc --version
         rustc -O -C panic=abort core.rs -o libcore_bits.a
-        libs=()
-        if [ "$(uname)" = Linux ]; then libs=(-lpthread -ldl); fi
-        cc -O2 bench.c obj/${{ matrix.obj }}/old.o obj/${{ matrix.obj }}/new.o obj/${{ matrix.obj }}/stg.o libcore_bits.a "${libs[@]}" -o bench
+        libs=""
+        if [ "$(uname)" = Linux ]; then libs="-lpthread -ldl"; fi
+        # shellcheck disable=SC2086 # libs is a word list
+        cc -O2 bench.c obj/${{ matrix.obj }}/old.o obj/${{ matrix.obj }}/new.o obj/${{ matrix.obj }}/stg.o libcore_bits.a $libs -o bench
         ./bench
         ./bench
