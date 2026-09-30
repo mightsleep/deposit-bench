@@ -1,6 +1,6 @@
 --- a/vortex-mask/src/intersect_by_rank.rs
 +++ b/vortex-mask/src/intersect_by_rank.rs
-@@ -588,6 +588,12 @@
+@@ -572,6 +572,12 @@
  
  /// The bit-buffer kernel for this CPU: its deposit instruction if it has one, otherwise `P`.
  fn select_bit_buffers<P: DepositBits>() -> IntersectBuffers {
@@ -13,9 +13,9 @@
      #[cfg(target_arch = "x86_64")]
      {
          if std::arch::is_x86_feature_detected!("bmi2") {
-@@ -606,6 +612,12 @@
+@@ -589,6 +595,12 @@
  
- /// The rank-indices kernel for this CPU, as [`select_bit_buffers`].
+ /// The rank-indices kernel for this CPU, as in [`select_bit_buffers`].
  fn select_rank_indices<P: DepositBits>() -> IntersectRankIndices {
 +    match std::env::var("VX_DEPOSIT").as_deref() {
 +        Ok("network") => return intersect_bit_buffer_by_rank_indices::<Portable>,
@@ -26,16 +26,3 @@
      #[cfg(target_arch = "x86_64")]
      {
          if std::arch::is_x86_feature_detected!("bmi2") {
-@@ -658,6 +670,12 @@
- where
-     I: Iterator<Item = usize>,
- {
-+    if matches!(
-+        std::env::var("VX_DEPOSIT").as_deref(),
-+        Ok("network" | "loop" | "adaptive")
-+    ) {
-+        return intersect_mask_driven::<Portable, _>(self_buffer, mask_indices, true_count);
-+    }
-     #[cfg(target_arch = "x86_64")]
-     if std::arch::is_x86_feature_detected!("bmi2") {
-         return intersect_mask_driven::<Bmi2, _>(self_buffer, mask_indices, true_count);
