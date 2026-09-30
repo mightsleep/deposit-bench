@@ -1,5 +1,5 @@
 diff --git a/vortex-mask/src/intersect_by_rank.rs b/vortex-mask/src/intersect_by_rank.rs
-index f163870d9..ed5bdc0b4 100644
+index f163870d9..b5d631b77 100644
 --- a/vortex-mask/src/intersect_by_rank.rs
 +++ b/vortex-mask/src/intersect_by_rank.rs
 @@ -17,11 +17,9 @@ use crate::MaskValues;
@@ -65,7 +65,9 @@ index f163870d9..ed5bdc0b4 100644
 +    fn deposit_bits(mut source: u64, mut mask: u64, mask_count: usize) -> u64 {
 +        if mask_count <= 2 {
 +            return deposit_two_lowest(source, mask);
-+        }
+         }
+-        source >>= 1;
+-        mask &= mask - 1;
 +
 +        let mut result = 0u64;
 +        while mask != 0 && source != 0 {
@@ -73,9 +75,7 @@ index f163870d9..ed5bdc0b4 100644
 +            result |= bit & (source & 1).wrapping_neg();
 +            source >>= 1;
 +            mask &= mask - 1;
-         }
--        source >>= 1;
--        mask &= mask - 1;
++        }
 +        result
      }
 -    result
@@ -87,7 +87,12 @@ index f163870d9..ed5bdc0b4 100644
 +}
 +
 +/// Deposit into the lowest two set bits of `mask`.
-+#[inline]
+ #[inline]
+-fn deposit_sparse_source(mut source: u64, mask: u64) -> u64 {
+-    let mut result = 0u64;
+-    while source != 0 {
+-        result |= select_set_bit(mask, source.trailing_zeros() as usize);
+-        source &= source - 1;
 +fn deposit_two_lowest(source: u64, mask: u64) -> u64 {
 +    let lowest = mask & mask.wrapping_neg();
 +    let rest = mask ^ lowest;
@@ -96,12 +101,7 @@ index f163870d9..ed5bdc0b4 100644
 +}
 +
 +/// Deposit into a mask with at most two clear bits: the source moves up by one past each hole.
- #[inline]
--fn deposit_sparse_source(mut source: u64, mask: u64) -> u64 {
--    let mut result = 0u64;
--    while source != 0 {
--        result |= select_set_bit(mask, source.trailing_zeros() as usize);
--        source &= source - 1;
++#[inline]
 +fn deposit_two_holes(mut source: u64, mask: u64) -> u64 {
 +    let mut holes = !mask;
 +    for _ in 0..2 {
@@ -174,7 +174,7 @@ index f163870d9..ed5bdc0b4 100644
  
      #[inline]
      fn deposit_bits(source: u64, mask: u64, _mask_count: usize) -> u64 {
-@@ -147,6 +217,43 @@ unsafe fn select_bit_position_bmi2(word: u64, rank: usize) -> usize {
+@@ -147,6 +217,53 @@ unsafe fn select_bit_position_bmi2(word: u64, rank: usize) -> usize {
      bit.trailing_zeros() as usize
  }
  
@@ -189,6 +189,16 @@ index f163870d9..ed5bdc0b4 100644
 +    fn deposit_bits(source: u64, mask: u64, _mask_count: usize) -> u64 {
 +        // SAFETY: callers only instantiate this implementation after checking SVE2 BITPERM support.
 +        unsafe { bdep_sve2(source, mask) }
++    }
++}
++
++#[cfg(target_arch = "aarch64")]
++impl SelectBit for Sve2Bdep {
++    #[inline]
++    fn select_bit_position(word: u64, rank: usize) -> usize {
++        debug_assert!(rank < word.count_ones() as usize);
++        // SAFETY: callers only instantiate this implementation after checking SVE2 BITPERM support.
++        unsafe { bdep_sve2(1u64 << rank, word) }.trailing_zeros() as usize
 +    }
 +}
 +
@@ -218,7 +228,7 @@ index f163870d9..ed5bdc0b4 100644
  /// Reader that pulls variable-length (0..=64 bit) groups from a [`BitBuffer`] sequentially.
  ///
  /// Maintains a 128-bit window over two consecutive chunks (`current`, `next`) and uses a
-@@ -235,21 +342,54 @@ fn mask_from_buffer(buffer: BitBuffer, true_count: usize) -> Mask {
+@@ -235,21 +352,54 @@ fn mask_from_buffer(buffer: BitBuffer, true_count: usize) -> Mask {
      }))
  }
  
@@ -281,7 +291,7 @@ index f163870d9..ed5bdc0b4 100644
      } else {
          D::deposit_bits(rank_bits, self_chunk, self_count)
      };
-@@ -267,18 +407,20 @@ fn intersect_bit_buffers<D: DepositBits>(
+@@ -267,18 +417,20 @@ fn intersect_bit_buffers<D: DepositBits>(
      let mut result = BufferMut::with_capacity(len.div_ceil(64));
      let mut reader = RankBitReader::new(mask_buffer);
      let self_chunks = self_buffer.chunks();
@@ -304,7 +314,7 @@ index f163870d9..ed5bdc0b4 100644
      }
  
      mask_from_buffer(
-@@ -296,12 +438,14 @@ fn intersect_bit_buffer_by_rank_indices<D: DepositBits>(
+@@ -296,12 +448,14 @@ fn intersect_bit_buffer_by_rank_indices<D: DepositBits>(
      let self_chunks = self_buffer.chunks();
      let mut rank_base = 0usize;
      let mut rank_idx = 0usize;
@@ -320,7 +330,7 @@ index f163870d9..ed5bdc0b4 100644
          rank_base = next_rank_base;
      }
  
-@@ -310,7 +454,7 @@ fn intersect_bit_buffer_by_rank_indices<D: DepositBits>(
+@@ -310,7 +464,7 @@ fn intersect_bit_buffer_by_rank_indices<D: DepositBits>(
          let self_count = self_chunk.count_ones() as usize;
          let next_rank_base = rank_base + self_count;
          let rank_bits = rank_bits_for_chunk(mask_indices, &mut rank_idx, rank_base, next_rank_base);
@@ -329,7 +339,7 @@ index f163870d9..ed5bdc0b4 100644
      }
  
      debug_assert_eq!(rank_idx, mask_indices.len());
-@@ -392,38 +536,112 @@ fn intersect_by_rank_indices(len: usize, self_indices: &[usize], mask_indices: &
+@@ -392,38 +546,129 @@ fn intersect_by_rank_indices(len: usize, self_indices: &[usize], mask_indices: &
      )
  }
  
@@ -365,6 +375,23 @@ index f163870d9..ed5bdc0b4 100644
 +    mask_indices: &[usize],
 +) -> Mask {
 +    intersect_bit_buffer_by_rank_indices::<Sve2Bdep>(self_buffer, mask_indices)
++}
++
++/// See [`intersect_bit_buffers_sve2`].
++///
++/// # Safety
++/// Requires SVE2 and SVE2 BITPERM.
++#[cfg(target_arch = "aarch64")]
++#[target_feature(enable = "sve2,sve2-bitperm")]
++unsafe fn intersect_mask_driven_sve2<I>(
++    self_buffer: &BitBuffer,
++    mask_indices: I,
++    true_count: usize,
++) -> Mask
++where
++    I: Iterator<Item = usize>,
++{
++    intersect_mask_driven::<Sve2Bdep, _>(self_buffer, mask_indices, true_count)
 +}
 +
 +/// The bit-buffer kernel for this CPU: its deposit instruction if it has one, otherwise `P`.
@@ -465,7 +492,20 @@ index f163870d9..ed5bdc0b4 100644
  }
  
  #[inline]
-@@ -522,10 +740,15 @@ impl Mask {
+@@ -440,6 +685,12 @@ where
+         return intersect_mask_driven::<Bmi2, _>(self_buffer, mask_indices, true_count);
+     }
+ 
++    #[cfg(target_arch = "aarch64")]
++    if std::arch::is_aarch64_feature_detected!("sve2-bitperm") {
++        // SAFETY: SVE2 BITPERM was just detected.
++        return unsafe { intersect_mask_driven_sve2(self_buffer, mask_indices, true_count) };
++    }
++
+     intersect_mask_driven::<Portable, _>(self_buffer, mask_indices, true_count)
+ }
+ 
+@@ -522,10 +773,15 @@ impl Mask {
                              self_values.bit_buffer(),
                              mask_values.bit_buffer(),
                              mask_values.true_count(),
@@ -482,7 +522,7 @@ index f163870d9..ed5bdc0b4 100644
                  }
  
                  let self_is_very_sparse = mask_is_sparse(self_values);
-@@ -551,6 +774,7 @@ impl Mask {
+@@ -551,6 +807,7 @@ impl Mask {
                      self_values.bit_buffer(),
                      mask_values.bit_buffer(),
                      mask_values.true_count(),
@@ -490,7 +530,7 @@ index f163870d9..ed5bdc0b4 100644
                  )
              }
          }
-@@ -562,6 +786,13 @@ mod tests {
+@@ -562,6 +819,15 @@ mod tests {
      use rstest::rstest;
      use vortex_buffer::BitBuffer;
  
@@ -498,13 +538,15 @@ index f163870d9..ed5bdc0b4 100644
 +    use super::Portable;
 +    use super::PortableLoop;
 +    #[cfg(target_arch = "aarch64")]
++    use super::SelectBit;
++    #[cfg(target_arch = "aarch64")]
 +    use super::Sve2Bdep;
 +    use super::intersect_bit_buffer_by_rank_indices;
 +    use super::intersect_bit_buffers;
      use crate::Mask;
  
      #[test]
-@@ -798,6 +1029,120 @@ mod tests {
+@@ -798,6 +1064,128 @@ mod tests {
          assert_eq!(base.intersect_by_rank(&rank_from_indices), expected);
      }
  
@@ -566,6 +608,14 @@ index f163870d9..ed5bdc0b4 100644
 +        deposit_matches_reference::<Sve2Bdep>();
 +        for offset in [0, 3] {
 +            kernels_match_reference::<Sve2Bdep>(offset);
++        }
++        let mut state = 0x9E37_79B9_7F4A_7C15;
++        for _ in 0..10_000 {
++            let word = xorshift(&mut state) | 1;
++            for rank in 0..word.count_ones() as usize {
++                let bit = deposit_reference(1u64 << rank, word).trailing_zeros() as usize;
++                assert_eq!(Sve2Bdep::select_bit_position(word, rank), bit);
++            }
 +        }
 +    }
 +
