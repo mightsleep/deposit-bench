@@ -1,47 +1,38 @@
 --- a/vortex-mask/src/intersect_by_rank.rs
 +++ b/vortex-mask/src/intersect_by_rank.rs
-@@ -636,6 +636,15 @@
- ) -> Mask {
-     type IntersectBuffers = fn(&BitBuffer, &BitBuffer, usize) -> Mask;
-     static KERNEL: CpuKernel<IntersectBuffers> = CpuKernel::new(|| {
-+        #[cfg(target_arch = "aarch64")]
-+        match std::env::var("VX_DEPOSIT").as_deref() {
-+            Ok("portable") => return intersect_bit_buffers::<Portable>,
-+            // SAFETY: measurement only, the workflow checks the feature first.
-+            Ok("pmull") => return |a, b, c| unsafe { intersect_bit_buffers_pmull(a, b, c) },
-+            // SAFETY: as above.
-+            Ok("bdep") => return |a, b, c| unsafe { intersect_bit_buffers_sve2(a, b, c) },
-+            _ => {}
-+        }
-         #[cfg(target_arch = "x86_64")]
-         {
-             if std::arch::is_x86_feature_detected!("bmi2") {
-@@ -664,6 +673,17 @@
- fn intersect_rank_indices_dispatch(self_buffer: &BitBuffer, mask_indices: &[usize]) -> Mask {
-     type IntersectRankIndices = fn(&BitBuffer, &[usize]) -> Mask;
-     static KERNEL: CpuKernel<IntersectRankIndices> = CpuKernel::new(|| {
-+        #[cfg(target_arch = "aarch64")]
-+        match std::env::var("VX_DEPOSIT").as_deref() {
-+            Ok("portable") => return intersect_bit_buffer_by_rank_indices::<Portable>,
-+            // SAFETY: measurement only, the workflow checks the feature first.
-+            Ok("pmull") => {
-+                return |a, b| unsafe { intersect_bit_buffer_by_rank_indices_pmull(a, b) };
-+            }
-+            // SAFETY: as above.
-+            Ok("bdep") => return |a, b| unsafe { intersect_bit_buffer_by_rank_indices_sve2(a, b) },
-+            _ => {}
-+        }
-         #[cfg(target_arch = "x86_64")]
-         {
-             if std::arch::is_x86_feature_detected!("bmi2") {
-@@ -697,6 +717,13 @@
+@@ -588,6 +588,12 @@
+ 
+ /// The bit-buffer kernel for this CPU: its deposit instruction if it has one, otherwise `P`.
+ fn select_bit_buffers<P: DepositBits>() -> IntersectBuffers {
++    match std::env::var("VX_DEPOSIT").as_deref() {
++        Ok("network") => return intersect_bit_buffers::<Portable>,
++        Ok("loop") => return intersect_bit_buffers::<PortableLoop>,
++        Ok("adaptive") => return intersect_bit_buffers::<P>,
++        _ => {}
++    }
+     #[cfg(target_arch = "x86_64")]
+     {
+         if std::arch::is_x86_feature_detected!("bmi2") {
+@@ -606,6 +612,12 @@
+ 
+ /// The rank-indices kernel for this CPU, as [`select_bit_buffers`].
+ fn select_rank_indices<P: DepositBits>() -> IntersectRankIndices {
++    match std::env::var("VX_DEPOSIT").as_deref() {
++        Ok("network") => return intersect_bit_buffer_by_rank_indices::<Portable>,
++        Ok("loop") => return intersect_bit_buffer_by_rank_indices::<PortableLoop>,
++        Ok("adaptive") => return intersect_bit_buffer_by_rank_indices::<P>,
++        _ => {}
++    }
+     #[cfg(target_arch = "x86_64")]
+     {
+         if std::arch::is_x86_feature_detected!("bmi2") {
+@@ -658,6 +670,12 @@
  where
      I: Iterator<Item = usize>,
  {
-+    #[cfg(target_arch = "aarch64")]
 +    if matches!(
 +        std::env::var("VX_DEPOSIT").as_deref(),
-+        Ok("portable" | "pmull")
++        Ok("network" | "loop" | "adaptive")
 +    ) {
 +        return intersect_mask_driven::<Portable, _>(self_buffer, mask_indices, true_count);
 +    }
