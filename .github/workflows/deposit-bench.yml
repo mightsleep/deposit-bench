@@ -1,7 +1,7 @@
 name: deposit-bench
 "on":
   push:
-    paths-ignore: [llvm-pext/**, .github/workflows/llvm-pext.yml]
+    paths-ignore: [llvm-pext/**, .github/workflows/llvm-pext.yml, vortex-ibr/**, .github/workflows/vortex-ibr.yml]
   workflow_dispatch: {}
 permissions:
   contents: read

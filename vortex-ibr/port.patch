@@ -1,0 +1,652 @@
+diff --git a/vortex-mask/src/intersect_by_rank.rs b/vortex-mask/src/intersect_by_rank.rs
+index f163870d9..c34a4e771 100644
+--- a/vortex-mask/src/intersect_by_rank.rs
++++ b/vortex-mask/src/intersect_by_rank.rs
+@@ -17,11 +17,10 @@ use crate::MaskValues;
+ use crate::MaskValuesRef;
+ 
+ trait DepositBits {
+-    /// Whether the implementation benefits from short-circuiting on `rank_bits == 0`
+-    /// and `self_chunk == u64::MAX`. The portable path loops `popcount(mask)` times,
+-    /// so an all-ones mask is genuinely expensive; BMI2 PDEP is constant-time and
+-    /// the branches just add mispredict cost.
+-    const PREFER_BRANCHES: bool;
++    /// Whether to look ahead for runs of eight `self` chunks that are all zeros or all ones and
++    /// skip the deposit for them. The portable deposit costs a few dozen instructions, which a
++    /// long run of trivial chunks would pay for nothing; BMI2 PDEP costs one, less than the check.
++    const SKIP_TRIVIAL_RUNS: bool;
+ 
+     fn deposit_bits(source: u64, mask: u64, mask_count: usize) -> u64;
+ }
+@@ -35,15 +34,15 @@ trait SelectBit {
+ struct Portable;
+ 
+ impl DepositBits for Portable {
+-    const PREFER_BRANCHES: bool = true;
++    const SKIP_TRIVIAL_RUNS: bool = true;
+ 
+     #[inline]
+     fn deposit_bits(source: u64, mask: u64, mask_count: usize) -> u64 {
+-        if mask_count >= 16 && source.count_ones() as usize * 8 < mask_count {
+-            return deposit_sparse_source(source, mask);
++        match mask_count {
++            0..=2 => deposit_two_lowest(source, mask),
++            62.. => deposit_two_holes(source, mask),
++            _ => deposit_bytewise(source, mask),
+         }
+-
+-        deposit_by_mask(source, mask)
+     }
+ }
+ 
+@@ -54,33 +53,81 @@ impl SelectBit for Portable {
+     }
+ }
+ 
++/// `b` in every byte of a word.
++const fn bytes(b: u8) -> u64 {
++    b as u64 * 0x0101_0101_0101_0101
++}
++
++/// Deposit into a mask of at most two bits: the lowest set bit and the one above it.
+ #[inline]
+-fn deposit_by_mask(mut source: u64, mut mask: u64) -> u64 {
+-    let mut result = 0u64;
+-    while mask != 0 {
+-        let bit = mask & mask.wrapping_neg();
+-        if source & 1 != 0 {
+-            result |= bit;
+-        }
+-        source >>= 1;
+-        mask &= mask - 1;
+-    }
+-    result
++fn deposit_two_lowest(source: u64, mask: u64) -> u64 {
++    let lowest = mask & mask.wrapping_neg();
++    let rest = mask ^ lowest;
++    let second = rest & rest.wrapping_neg();
++    (lowest & (source & 1).wrapping_neg()) | (second & ((source >> 1) & 1).wrapping_neg())
+ }
+ 
++/// Deposit into a mask with at most two clear bits: the source moves up by one past each hole.
+ #[inline]
+-fn deposit_sparse_source(mut source: u64, mask: u64) -> u64 {
+-    let mut result = 0u64;
+-    while source != 0 {
+-        result |= select_set_bit(mask, source.trailing_zeros() as usize);
+-        source &= source - 1;
++fn deposit_two_holes(mut source: u64, mask: u64) -> u64 {
++    let mut holes = !mask;
++    for _ in 0..2 {
++        let hole = holes & holes.wrapping_neg();
++        let below = hole.wrapping_sub(1);
++        source = (source & below) | ((source << 1) & !below);
++        holes ^= hole;
+     }
+-    result
++    source & mask
+ }
+ 
++/// Branch-free deposit, a byte at a time.
++///
++/// Byte `j` of the result takes its source bits from the number of mask bits in the bytes below
++/// it; one multiply sums the per-byte counts for all bytes at once. Within each byte, the bits
++/// are then spread out by running backwards the compress network of Hacker's Delight 7-4 (the
++/// scheme of `uN::extract_bits` in the Rust core library), whose stages come from compressing
++/// the mask itself: three shift-and-XOR stages for 8 bits instead of six for 64.
+ #[inline]
+-fn select_set_bit(word: u64, rank: usize) -> u64 {
+-    1u64 << select_bit_position_portable(word, rank)
++fn deposit_bytewise(source: u64, mask: u64) -> u64 {
++    let pairs = mask - ((mask >> 1) & bytes(0x55));
++    let nibbles = (pairs & bytes(0x33)) + ((pairs >> 2) & bytes(0x33));
++    let counts = (nibbles + (nibbles >> 4)) & bytes(0x0F);
++    // Byte j holds the mask bits in bytes 0..j. The sums stay below 64, so no byte carries.
++    let below = counts.wrapping_mul(bytes(1)) << 8;
++
++    // Compress the mask within each byte. Stage i moves down by 2^i the bits for which the
++    // number of mask zeros below them in the byte has bit i set, and `landed` keeps where they
++    // land. Before stage i the zeros stand in aligned groups of 2^i, so the parity of the
++    // groups below each bit is a prefix XOR that can start at a shift of 2^i.
++    let mut packed = mask;
++    let mut zeros = !mask;
++    let mut landed = [0u64; 3];
++    for (stage, landed) in landed.iter_mut().enumerate() {
++        let shift = 1 << stage;
++        let mut parity = zeros;
++        let mut len = shift;
++        while len < 8 {
++            parity ^= (parity << len) & bytes(0xFF << len);
++            len <<= 1;
++        }
++        let moving = packed & parity;
++        *landed = (moving >> shift) & bytes(0xFF >> shift);
++        packed ^= moving ^ *landed;
++        zeros &= !parity;
++        zeros ^= (zeros >> shift) & bytes(0xFF >> shift);
++    }
++
++    // Pack the source bits of each byte at its low end, then undo the stages.
++    let mut result = 0;
++    for byte in 0..8 {
++        let from = (below >> (8 * byte)) & 0xFF;
++        result |= ((source >> from) & 0xFF) << (8 * byte);
++    }
++    result &= packed;
++    for (stage, landed) in landed.iter().enumerate().rev() {
++        result = (result & !landed) | ((result & landed) << (1 << stage));
++    }
++    result & mask
+ }
+ 
+ #[inline]
+@@ -111,7 +158,7 @@ struct Bmi2;
+ 
+ #[cfg(target_arch = "x86_64")]
+ impl DepositBits for Bmi2 {
+-    const PREFER_BRANCHES: bool = false;
++    const SKIP_TRIVIAL_RUNS: bool = false;
+ 
+     #[inline]
+     fn deposit_bits(source: u64, mask: u64, _mask_count: usize) -> u64 {
+@@ -147,6 +194,102 @@ unsafe fn select_bit_position_bmi2(word: u64, rank: usize) -> usize {
+     bit.trailing_zeros() as usize
+ }
+ 
++#[cfg(target_arch = "aarch64")]
++struct Sve2Bdep;
++
++#[cfg(target_arch = "aarch64")]
++impl DepositBits for Sve2Bdep {
++    const SKIP_TRIVIAL_RUNS: bool = false;
++
++    #[inline]
++    fn deposit_bits(source: u64, mask: u64, _mask_count: usize) -> u64 {
++        // SAFETY: callers only instantiate this implementation after checking SVE2 BITPERM support.
++        unsafe { bdep_sve2(source, mask) }
++    }
++}
++
++#[cfg(target_arch = "aarch64")]
++impl SelectBit for Sve2Bdep {
++    #[inline]
++    fn select_bit_position(word: u64, rank: usize) -> usize {
++        debug_assert!(rank < word.count_ones() as usize);
++        // SAFETY: callers only instantiate this implementation after checking SVE2 BITPERM support.
++        unsafe { bdep_sve2(1u64 << rank, word) }.trailing_zeros() as usize
++    }
++}
++
++/// SVE2 BDEP on the lowest 64-bit lane. The words come one at a time from the rank reader, and
++/// the round trip through the vector registers costs less than batching them for a predicated
++/// loop over whole vectors.
++#[cfg(target_arch = "aarch64")]
++#[target_feature(enable = "sve2,sve2-bitperm")]
++unsafe fn bdep_sve2(source: u64, mask: u64) -> u64 {
++    let result: u64;
++    // SAFETY: registers only; the caller checked SVE2 BITPERM support.
++    unsafe {
++        std::arch::asm!(
++            "fmov d0, {source}",
++            "fmov d1, {mask}",
++            "bdep z0.d, z0.d, z1.d",
++            "fmov {result}, d0",
++            source = in(reg) source,
++            mask = in(reg) mask,
++            result = lateout(reg) result,
++            out("v0") _,
++            out("v1") _,
++            options(pure, nomem, nostack),
++        );
++    }
++    result
++}
++
++/// Hacker's Delight 7-5 over the whole word, each prefix XOR one carry-less multiply by all ones.
++/// PMULL takes a round trip through the vector registers, so this pays only where PMULL is fast.
++#[cfg(target_arch = "aarch64")]
++struct Pmull;
++
++#[cfg(target_arch = "aarch64")]
++impl DepositBits for Pmull {
++    const SKIP_TRIVIAL_RUNS: bool = true;
++
++    #[inline]
++    fn deposit_bits(source: u64, mask: u64, mask_count: usize) -> u64 {
++        match mask_count {
++            0..=2 => deposit_two_lowest(source, mask),
++            62.. => deposit_two_holes(source, mask),
++            // SAFETY: callers only instantiate this implementation after checking PMULL support.
++            _ => unsafe { deposit_pmull(source, mask) },
++        }
++    }
++}
++
++#[cfg(target_arch = "aarch64")]
++#[target_feature(enable = "aes")]
++unsafe fn deposit_pmull(source: u64, mask: u64) -> u64 {
++    use std::arch::aarch64::vmull_p64;
++
++    // Compress the mask as in Hacker's Delight 7-4, keeping the bits each stage moves: stage i
++    // moves down by 2^i the bits for which the number of mask zeros below them has bit i set.
++    let mut packed = mask;
++    let mut zeros_below = !mask << 1;
++    let mut landed = [0u64; 6];
++    for (stage, landed) in landed.iter_mut().enumerate() {
++        // The low half of the product with all ones is the prefix XOR.
++        #[expect(clippy::cast_possible_truncation)]
++        let parity = vmull_p64(zeros_below, u64::MAX) as u64;
++        let moving = parity & packed;
++        *landed = moving >> (1 << stage);
++        packed = (packed ^ moving) | *landed;
++        zeros_below &= !parity;
++    }
++
++    let mut result = source & packed;
++    for (stage, landed) in landed.iter().enumerate().rev() {
++        result = (result & !landed) | ((result & landed) << (1 << stage));
++    }
++    result & mask
++}
++
+ /// Reader that pulls variable-length (0..=64 bit) groups from a [`BitBuffer`] sequentially.
+ ///
+ /// Maintains a 128-bit window over two consecutive chunks (`current`, `next`) and uses a
+@@ -235,21 +378,56 @@ fn mask_from_buffer(buffer: BitBuffer, true_count: usize) -> Mask {
+     }))
+ }
+ 
++/// Tells, chunk by chunk, whether a chunk of `self` lies in a block of eight that are all zeros
++/// or all ones. For those the result chunk is the rank bits read for it as they are, zero bits
++/// for an empty chunk and all of them for a full one. A second iterator over the same chunks
++/// checks each block as the loop reaches it, so the loop itself keeps one chunk per iteration
++/// and no fixed-length block for the compiler to unroll around the deposit.
++struct TrivialRuns<'a> {
++    ahead: BitChunkIterator<'a>,
++    left: usize,
++    trivial: bool,
++}
++
++impl<'a> TrivialRuns<'a> {
++    const BLOCK: usize = 8;
++
++    fn new(ahead: BitChunkIterator<'a>) -> Self {
++        Self {
++            ahead,
++            left: 0,
++            trivial: false,
++        }
++    }
++
++    #[inline]
++    fn next_is_trivial(&mut self) -> bool {
++        if self.left == 0 {
++            self.left = Self::BLOCK;
++            self.trivial = self.ahead.len() >= Self::BLOCK
++                && self
++                    .ahead
++                    .by_ref()
++                    .take(Self::BLOCK)
++                    .fold(true, |all, chunk| {
++                        all & ((chunk == 0) | (chunk == u64::MAX))
++                    });
++        }
++        self.left -= 1;
++        self.trivial
++    }
++}
++
+ #[inline]
+ fn push_result_chunk<D: DepositBits>(
+     result: &mut BufferMut<u64>,
+     self_chunk: u64,
+     self_count: usize,
+     rank_bits: u64,
++    trivial: bool,
+ ) {
+-    let chunk = if D::PREFER_BRANCHES {
+-        if rank_bits == 0 {
+-            0
+-        } else if self_chunk == u64::MAX {
+-            rank_bits
+-        } else {
+-            D::deposit_bits(rank_bits, self_chunk, self_count)
+-        }
++    let chunk = if trivial {
++        rank_bits
+     } else {
+         D::deposit_bits(rank_bits, self_chunk, self_count)
+     };
+@@ -267,18 +445,20 @@ fn intersect_bit_buffers<D: DepositBits>(
+     let mut result = BufferMut::with_capacity(len.div_ceil(64));
+     let mut reader = RankBitReader::new(mask_buffer);
+     let self_chunks = self_buffer.chunks();
++    let mut runs = TrivialRuns::new(self_chunks.iter());
+ 
+     for self_chunk in self_chunks.iter() {
+         let self_count = self_chunk.count_ones() as usize;
+         let rank_bits = reader.read(self_count);
+-        push_result_chunk::<D>(&mut result, self_chunk, self_count, rank_bits);
++        let trivial = D::SKIP_TRIVIAL_RUNS && runs.next_is_trivial();
++        push_result_chunk::<D>(&mut result, self_chunk, self_count, rank_bits, trivial);
+     }
+ 
+     if self_chunks.remainder_len() != 0 {
+         let self_chunk = self_chunks.remainder_bits();
+         let self_count = self_chunk.count_ones() as usize;
+         let rank_bits = reader.read(self_count);
+-        push_result_chunk::<D>(&mut result, self_chunk, self_count, rank_bits);
++        push_result_chunk::<D>(&mut result, self_chunk, self_count, rank_bits, false);
+     }
+ 
+     mask_from_buffer(
+@@ -296,12 +476,14 @@ fn intersect_bit_buffer_by_rank_indices<D: DepositBits>(
+     let self_chunks = self_buffer.chunks();
+     let mut rank_base = 0usize;
+     let mut rank_idx = 0usize;
++    let mut runs = TrivialRuns::new(self_chunks.iter());
+ 
+     for self_chunk in self_chunks.iter() {
+         let self_count = self_chunk.count_ones() as usize;
+         let next_rank_base = rank_base + self_count;
+         let rank_bits = rank_bits_for_chunk(mask_indices, &mut rank_idx, rank_base, next_rank_base);
+-        push_result_chunk::<D>(&mut result, self_chunk, self_count, rank_bits);
++        let trivial = D::SKIP_TRIVIAL_RUNS && runs.next_is_trivial();
++        push_result_chunk::<D>(&mut result, self_chunk, self_count, rank_bits, trivial);
+         rank_base = next_rank_base;
+     }
+ 
+@@ -310,7 +492,7 @@ fn intersect_bit_buffer_by_rank_indices<D: DepositBits>(
+         let self_count = self_chunk.count_ones() as usize;
+         let next_rank_base = rank_base + self_count;
+         let rank_bits = rank_bits_for_chunk(mask_indices, &mut rank_idx, rank_base, next_rank_base);
+-        push_result_chunk::<D>(&mut result, self_chunk, self_count, rank_bits);
++        push_result_chunk::<D>(&mut result, self_chunk, self_count, rank_bits, false);
+     }
+ 
+     debug_assert_eq!(rank_idx, mask_indices.len());
+@@ -392,6 +574,60 @@ fn intersect_by_rank_indices(len: usize, self_indices: &[usize], mask_indices: &
+     )
+ }
+ 
++// The kernels with SVE2 enabled for the whole loop, so that BDEP inlines into it rather than
++// costing a call, and the registers saved around it, per chunk.
++
++#[cfg(target_arch = "aarch64")]
++#[target_feature(enable = "sve2,sve2-bitperm")]
++unsafe fn intersect_bit_buffers_sve2(
++    self_buffer: &BitBuffer,
++    mask_buffer: &BitBuffer,
++    true_count: usize,
++) -> Mask {
++    intersect_bit_buffers::<Sve2Bdep>(self_buffer, mask_buffer, true_count)
++}
++
++#[cfg(target_arch = "aarch64")]
++#[target_feature(enable = "sve2,sve2-bitperm")]
++unsafe fn intersect_bit_buffer_by_rank_indices_sve2(
++    self_buffer: &BitBuffer,
++    mask_indices: &[usize],
++) -> Mask {
++    intersect_bit_buffer_by_rank_indices::<Sve2Bdep>(self_buffer, mask_indices)
++}
++
++#[cfg(target_arch = "aarch64")]
++#[target_feature(enable = "sve2,sve2-bitperm")]
++unsafe fn intersect_mask_driven_sve2<I>(
++    self_buffer: &BitBuffer,
++    mask_indices: I,
++    true_count: usize,
++) -> Mask
++where
++    I: Iterator<Item = usize>,
++{
++    intersect_mask_driven::<Sve2Bdep, _>(self_buffer, mask_indices, true_count)
++}
++
++#[cfg(target_arch = "aarch64")]
++#[target_feature(enable = "aes")]
++unsafe fn intersect_bit_buffers_pmull(
++    self_buffer: &BitBuffer,
++    mask_buffer: &BitBuffer,
++    true_count: usize,
++) -> Mask {
++    intersect_bit_buffers::<Pmull>(self_buffer, mask_buffer, true_count)
++}
++
++#[cfg(target_arch = "aarch64")]
++#[target_feature(enable = "aes")]
++unsafe fn intersect_bit_buffer_by_rank_indices_pmull(
++    self_buffer: &BitBuffer,
++    mask_indices: &[usize],
++) -> Mask {
++    intersect_bit_buffer_by_rank_indices::<Pmull>(self_buffer, mask_indices)
++}
++
+ #[inline]
+ fn intersect_bit_buffers_dispatch(
+     self_buffer: &BitBuffer,
+@@ -406,6 +642,19 @@ fn intersect_bit_buffers_dispatch(
+                 return intersect_bit_buffers::<Bmi2>;
+             }
+         }
++        #[cfg(target_arch = "aarch64")]
++        {
++            if std::arch::is_aarch64_feature_detected!("sve2-bitperm") {
++                // SAFETY: SVE2 BITPERM was just detected.
++                return |a, b, c| unsafe { intersect_bit_buffers_sve2(a, b, c) };
++            }
++            // PMULL is cheap on the Apple cores, where the whole-word form wins.
++            #[cfg(target_vendor = "apple")]
++            if std::arch::is_aarch64_feature_detected!("pmull") {
++                // SAFETY: PMULL was just detected.
++                return |a, b, c| unsafe { intersect_bit_buffers_pmull(a, b, c) };
++            }
++        }
+         intersect_bit_buffers::<Portable>
+     });
+     KERNEL.get()(self_buffer, mask_buffer, true_count)
+@@ -421,6 +670,19 @@ fn intersect_rank_indices_dispatch(self_buffer: &BitBuffer, mask_indices: &[usiz
+                 return intersect_bit_buffer_by_rank_indices::<Bmi2>;
+             }
+         }
++        #[cfg(target_arch = "aarch64")]
++        {
++            if std::arch::is_aarch64_feature_detected!("sve2-bitperm") {
++                // SAFETY: SVE2 BITPERM was just detected.
++                return |a, b| unsafe { intersect_bit_buffer_by_rank_indices_sve2(a, b) };
++            }
++            // PMULL is cheap on the Apple cores, where the whole-word form wins.
++            #[cfg(target_vendor = "apple")]
++            if std::arch::is_aarch64_feature_detected!("pmull") {
++                // SAFETY: PMULL was just detected.
++                return |a, b| unsafe { intersect_bit_buffer_by_rank_indices_pmull(a, b) };
++            }
++        }
+         intersect_bit_buffer_by_rank_indices::<Portable>
+     });
+     KERNEL.get()(self_buffer, mask_indices)
+@@ -440,6 +702,12 @@ where
+         return intersect_mask_driven::<Bmi2, _>(self_buffer, mask_indices, true_count);
+     }
+ 
++    #[cfg(target_arch = "aarch64")]
++    if std::arch::is_aarch64_feature_detected!("sve2-bitperm") {
++        // SAFETY: SVE2 BITPERM was just detected.
++        return unsafe { intersect_mask_driven_sve2(self_buffer, mask_indices, true_count) };
++    }
++
+     intersect_mask_driven::<Portable, _>(self_buffer, mask_indices, true_count)
+ }
+ 
+@@ -562,6 +830,16 @@ mod tests {
+     use rstest::rstest;
+     use vortex_buffer::BitBuffer;
+ 
++    use super::DepositBits;
++    #[cfg(target_arch = "aarch64")]
++    use super::Pmull;
++    use super::Portable;
++    #[cfg(target_arch = "aarch64")]
++    use super::SelectBit;
++    #[cfg(target_arch = "aarch64")]
++    use super::Sve2Bdep;
++    use super::intersect_bit_buffer_by_rank_indices;
++    use super::intersect_bit_buffers;
+     use crate::Mask;
+ 
+     #[test]
+@@ -798,6 +1076,153 @@ mod tests {
+         assert_eq!(base.intersect_by_rank(&rank_from_indices), expected);
+     }
+ 
++    /// xorshift64, so the portable tests need no dependency and see the same words on every run.
++    fn xorshift(state: &mut u64) -> u64 {
++        *state ^= *state << 13;
++        *state ^= *state >> 7;
++        *state ^= *state << 17;
++        *state
++    }
++
++    fn deposit_reference(mut source: u64, mut mask: u64) -> u64 {
++        let mut result = 0u64;
++        while mask != 0 {
++            let bit = mask & mask.wrapping_neg();
++            if source & 1 != 0 {
++                result |= bit;
++            }
++            source >>= 1;
++            mask &= mask - 1;
++        }
++        result
++    }
++
++    #[test]
++    fn portable_deposit_matches_reference() {
++        deposit_matches_reference::<Portable>();
++    }
++
++    fn deposit_matches_reference<D: DepositBits>() {
++        let mut state = 0x9E37_79B9_7F4A_7C15;
++        for round in 0..200_000 {
++            // AND or OR of up to three random words gives densities from 1/8 to 7/8, and every
++            // 16th round keeps 0 to 2 bits or clears 0 to 2 bits, for the two edge tiers.
++            let mut mask = xorshift(&mut state);
++            match round % 8 {
++                0 => mask &= xorshift(&mut state) & xorshift(&mut state),
++                1 => mask &= xorshift(&mut state),
++                2 => mask |= xorshift(&mut state),
++                3 => mask |= xorshift(&mut state) | xorshift(&mut state),
++                _ => {}
++            }
++            if round % 16 == 5 {
++                mask = (1u64 << (mask % 64)) & (xorshift(&mut state) | 1);
++                mask |= (1u64 << (xorshift(&mut state) % 64)) & xorshift(&mut state);
++            } else if round % 16 == 13 {
++                mask = !((1u64 << (mask % 64)) & xorshift(&mut state));
++                mask &= !((1u64 << (xorshift(&mut state) % 64)) & xorshift(&mut state));
++            }
++            let source = xorshift(&mut state);
++            let count = mask.count_ones() as usize;
++            assert_eq!(
++                D::deposit_bits(source, mask, count),
++                deposit_reference(source, mask),
++                "source {source:#018x}, mask {mask:#018x}"
++            );
++        }
++        for mask in [0, 1, 1 << 63, u64::MAX, u64::MAX - 1, u64::MAX >> 1] {
++            let count = mask.count_ones() as usize;
++            assert_eq!(
++                D::deposit_bits(u64::MAX, mask, count),
++                deposit_reference(u64::MAX, mask)
++            );
++        }
++    }
++
++    #[cfg(target_arch = "aarch64")]
++    #[test]
++    fn sve2_bdep_matches_reference() {
++        if !std::arch::is_aarch64_feature_detected!("sve2-bitperm") {
++            return;
++        }
++        deposit_matches_reference::<Sve2Bdep>();
++        for offset in [0, 3] {
++            kernels_match_reference::<Sve2Bdep>(offset);
++        }
++        let mut state = 0x9E37_79B9_7F4A_7C15;
++        for _ in 0..10_000 {
++            let word = xorshift(&mut state) | 1;
++            for rank in 0..word.count_ones() as usize {
++                let bit = deposit_reference(1u64 << rank, word).trailing_zeros() as usize;
++                assert_eq!(Sve2Bdep::select_bit_position(word, rank), bit);
++            }
++        }
++    }
++
++    #[cfg(target_arch = "aarch64")]
++    #[test]
++    fn pmull_matches_reference() {
++        if !std::arch::is_aarch64_feature_detected!("pmull") {
++            return;
++        }
++        deposit_matches_reference::<Pmull>();
++        for offset in [0, 3] {
++            kernels_match_reference::<Pmull>(offset);
++        }
++    }
++
++    /// The portable kernels directly, as dispatch picks BMI2 where it is available.
++    #[rstest]
++    #[case::aligned(0)]
++    #[case::offset(3)]
++    fn portable_intersect_with_trivial_runs(#[case] offset: usize) {
++        kernels_match_reference::<Portable>(offset);
++    }
++
++    /// Both bit-buffer kernels with deposit `D`. Runs of empty and full chunks, aligned to the
++    /// blocks of eight and not, sit between random ones.
++    fn kernels_match_reference<D: DepositBits>(offset: usize) {
++        let mut state = 0x2545_F491_4F6C_DD1D;
++        let mut base_source = vec![false; offset];
++        for run in 0..48 {
++            let words = 1 + (xorshift(&mut state) % 20) as usize;
++            for _ in 0..words {
++                let word = match run % 3 {
++                    0 => 0,
++                    1 => u64::MAX,
++                    _ => xorshift(&mut state),
++                };
++                base_source.extend((0..64).map(|i| (word >> i) & 1 == 1));
++            }
++        }
++        base_source.extend([true, false, true, true, false]);
++        let base_len = base_source.len() - offset;
++        let base_bits = base_source[offset..].to_vec();
++        let base_buffer = BitBuffer::from(base_source).slice(offset..offset + base_len);
++
++        let rank_len = base_bits.iter().filter(|&&b| b).count();
++        let rank_bits: Vec<bool> = (0..rank_len)
++            .map(|_| !xorshift(&mut state).is_multiple_of(3))
++            .collect();
++        let rank_buffer = BitBuffer::from(rank_bits.clone());
++        let rank_indices: Vec<usize> = rank_bits
++            .iter()
++            .enumerate()
++            .filter_map(|(idx, &value)| value.then_some(idx))
++            .collect();
++
++        let expected = expected_intersect_by_rank(&base_bits, &rank_bits);
++
++        assert_eq!(
++            intersect_bit_buffers::<D>(&base_buffer, &rank_buffer, rank_indices.len()),
++            expected
++        );
++        assert_eq!(
++            intersect_bit_buffer_by_rank_indices::<D>(&base_buffer, &rank_indices),
++            expected
++        );
++    }
++
+     fn expected_intersect_by_rank(base_bits: &[bool], rank_bits: &[bool]) -> Mask {
+         let mut rank = 0usize;
+         Mask::from_iter(base_bits.iter().map(|&is_set| {

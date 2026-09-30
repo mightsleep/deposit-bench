@@ -1,0 +1,28 @@
+name: vortex-ibr
+"on":
+  push:
+    paths: [vortex-ibr/**, .github/workflows/vortex-ibr.yml]
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04-arm, macos-15]
+    runs-on: ${{ matrix.runner }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: CPU
+      run: |
+        if command -v lscpu > /dev/null; then
+          lscpu | grep -E "Model name|Architecture|Flags" | cut -c1-400
+        else
+          echo "Model name: $(sysctl -n machdep.cpu.brand_string)"
+          sysctl hw.optional | grep -E "arm\.FEAT_(PMULL|SVE)" || true
+        fi
+    - name: bench
+      run: sh vortex-ibr/run.sh
