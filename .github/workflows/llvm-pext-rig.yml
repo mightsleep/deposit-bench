@@ -1,0 +1,28 @@
+name: llvm-pext-rig
+"on":
+  push:
+    paths: [llvm-pext/rig/**, .github/workflows/llvm-pext-rig.yml]
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  # dry run of the rented-machine script: Cobalt 100 (N2) with perf, and the
+  # macOS VM, where kperf may well refuse; the bench says so
+  rig:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04-arm, macos-15]
+    runs-on: ${{ matrix.runner }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: bench
+      run: |
+        if [ "$(uname -s)" = Linux ]; then
+          sudo sysctl kernel.perf_event_paranoid=2
+          ROUNDS=1 sh llvm-pext/rig/run.sh
+        else
+          sudo ROUNDS=1 sh llvm-pext/rig/run.sh
+        fi
