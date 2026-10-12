@@ -1,0 +1,12 @@
+--- a/vortex-array/src/arrays/bool/compute/filter.rs
++++ b/vortex-array/src/arrays/bool/compute/filter.rs
+@@ -32,6 +32,9 @@
+ fn hardware_pext() -> bool {
+     static HARDWARE: OnceLock<bool> = OnceLock::new();
+     *HARDWARE.get_or_init(|| {
++        if std::env::var_os("FORCE_FALLBACK").is_some() {
++            return false;
++        }
+         #[cfg(target_arch = "x86_64")]
+         {
+             return has_fast_pext();

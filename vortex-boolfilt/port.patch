@@ -1,0 +1,406 @@
+diff --git a/vortex-array/src/arrays/bool/compute/filter.rs b/vortex-array/src/arrays/bool/compute/filter.rs
+index 79a0a2981..43dadcedf 100644
+--- a/vortex-array/src/arrays/bool/compute/filter.rs
++++ b/vortex-array/src/arrays/bool/compute/filter.rs
+@@ -1,6 +1,8 @@
+ // SPDX-License-Identifier: Apache-2.0
+ // SPDX-FileCopyrightText: Copyright the Vortex contributors
+ 
++use std::sync::OnceLock;
++
+ use vortex_buffer::BitBuffer;
+ use vortex_buffer::BitBufferMut;
+ use vortex_buffer::BufferMut;
+@@ -19,9 +21,29 @@ use crate::arrays::BoolArray;
+ use crate::arrays::bool::BoolArrayExt;
+ use crate::arrays::filter::FilterReduce;
+ 
+-/// Below this density threshold, use the sparse path which iterates only set
+-/// bits in the mask. Above it, the word-level PEXT approach is faster.
+-const SPARSE_DENSITY_THRESHOLD: f64 = 0.05;
++/// Below this density of the mask, iterating its set bits beats compressing whole words: near 5 %
++/// with PEXT in hardware, near 12 % with the portable compress.
++fn sparse_density_threshold() -> f64 {
++    if hardware_pext() { 0.05 } else { 0.12 }
++}
++
++/// Whether [`filter_bitbuffer_by_mask`] compresses words in hardware: BMI2 PEXT where it is fast,
++/// or SVE2 BEXT.
++fn hardware_pext() -> bool {
++    static HARDWARE: OnceLock<bool> = OnceLock::new();
++    *HARDWARE.get_or_init(|| {
++        #[cfg(target_arch = "x86_64")]
++        {
++            return has_fast_pext();
++        }
++        #[cfg(target_arch = "aarch64")]
++        {
++            return std::arch::is_aarch64_feature_detected!("sve2-bitperm");
++        }
++        #[allow(unreachable_code)]
++        false
++    })
++}
+ 
+ impl FilterReduce for Bool {
+     fn filter(array: ArrayView<'_, Bool>, mask: &Mask) -> VortexResult<Option<ArrayRef>> {
+@@ -33,7 +55,7 @@ impl FilterReduce for Bool {
+ 
+         let src = array.to_bit_buffer();
+         let density = mask_values.density();
+-        let buffer = if density < SPARSE_DENSITY_THRESHOLD {
++        let buffer = if density < sparse_density_threshold() {
+             filter_sparse(&src, mask_values, mask.true_count())
+         } else {
+             filter_bitbuffer_by_mask(&src, mask_values.bit_buffer(), mask.true_count())
+@@ -94,11 +116,11 @@ pub fn filter_bitbuffer_by_mask(
+ ) -> BitBuffer {
+     type FilterKernel = unsafe fn(&BitBuffer, &BitBuffer, usize) -> BitBuffer;
+     static KERNEL: CpuKernel<FilterKernel> = CpuKernel::new(|| {
+-        #[cfg(target_arch = "x86_64")]
+-        {
+-            if std::arch::is_x86_feature_detected!("bmi2") {
+-                return filter_pext_bmi2;
+-            }
++        if hardware_pext() {
++            #[cfg(target_arch = "x86_64")]
++            return filter_pext_bmi2;
++            #[cfg(target_arch = "aarch64")]
++            return filter_bext_sve2;
+         }
+         filter_pext_fallback
+     });
+@@ -120,7 +142,17 @@ unsafe fn filter_pext_bmi2(src: &BitBuffer, mask_buf: &BitBuffer, true_count: us
+     filter_inner(src, mask_buf, true_count, |src, mask| _pext_u64(src, mask))
+ }
+ 
+-/// Software fallback filter using byte-LUT PEXT.
++/// SVE2 filter: compiled with SVE2 as a whole, so BEXT inlines into the loop.
++#[cfg(target_arch = "aarch64")]
++#[target_feature(enable = "sve2,sve2-bitperm")]
++unsafe fn filter_bext_sve2(src: &BitBuffer, mask_buf: &BitBuffer, true_count: usize) -> BitBuffer {
++    // SAFETY: the selector checked SVE2 BITPERM support.
++    filter_inner(src, mask_buf, true_count, |src, mask| unsafe {
++        bext_sve2(src, mask)
++    })
++}
++
++/// Portable filter, PEXT by [`pext_fallback`].
+ fn filter_pext_fallback(src: &BitBuffer, mask_buf: &BitBuffer, true_count: usize) -> BitBuffer {
+     filter_inner(src, mask_buf, true_count, pext_fallback)
+ }
+@@ -218,88 +250,118 @@ fn filter_inner(
+     BitBuffer::new(bytes.freeze(), true_count)
+ }
+ 
+-/// Byte-level LUT PEXT fallback.
++/// Portable PEXT: the kept bits of `src`, packed at the bottom.
+ ///
+-/// Processes each byte of the u64 independently using a precomputed 256-entry
+-/// lookup table per mask byte. Each byte PEXT is a single table lookup with no
+-/// data dependencies between bytes, making this faster than the parallel-prefix
+-/// approach (~12ns vs ~18ns per word).
++/// Masks made of runs keep one or two contiguous runs per word, where shifts suffice; any other
++/// mask goes through [`compress_bytes`]. No table, so the cache is left alone.
+ #[allow(clippy::inline_always)]
+ #[inline(always)]
+ pub fn pext_fallback(src: u64, mask: u64) -> u64 {
+-    pext_byte_lut(src, mask)
+-}
+-
+-/// Precomputed lookup table for 8-bit PEXT.
+-///
+-/// `BYTE_PEXT_LUT[mask_byte]` is a 256-byte table mapping `src_byte` to the
+-/// extracted bits. Total size: 256 * 256 = 64KB, fits in L1 cache.
+-#[allow(clippy::cast_possible_truncation)]
+-static BYTE_PEXT_LUT: &[u8; 256 * 256] = &{
+-    let mut lut = [0u8; 256 * 256];
+-    let mut mask: usize = 0;
+-    while mask < 256 {
+-        let mut src: usize = 0;
+-        while src < 256 {
+-            let mut result = 0u8;
+-            let mut bit = 0u8;
+-            // mask and src are always < 256, so truncation to u8 is safe.
+-            let mut m = mask as u8;
+-            let s = src as u8;
+-            let mut pos: u8 = 0;
+-            while m != 0 {
+-                if m & 1 != 0 {
+-                    if s & (1 << pos) != 0 {
+-                        result |= 1 << bit;
+-                    }
+-                    bit += 1;
+-                }
+-                m >>= 1;
+-                pos += 1;
+-            }
+-            lut[mask * 256 + src] = result;
+-            src += 1;
+-        }
+-        mask += 1;
++    // Adding the lowest set bit clears the lowest run, so what is left of the mask is the rest.
++    let low = mask & mask.wrapping_neg();
++    let rest = mask & mask.wrapping_add(low);
++    if rest == 0 {
++        // An empty mask shifts by 64, harmless as `src & mask` is 0 then.
++        return (src & mask).wrapping_shr(mask.trailing_zeros());
++    }
++    let rest_low = rest & rest.wrapping_neg();
++    if rest & rest.wrapping_add(rest_low) == 0 {
++        let first = mask ^ rest;
++        let first_len = (first >> first.trailing_zeros()).trailing_ones();
++        return ((src & first) >> first.trailing_zeros())
++            | ((src & rest) >> (rest.trailing_zeros() - first_len));
+     }
+-    lut
+-};
++    compress_bytes(src, mask)
++}
+ 
+-/// Byte-level PEXT using precomputed lookup table.
++/// Inside each byte, the compress network of Hacker's Delight 7-4 runs on all eight bytes at
++/// once, three rounds for 8 bits instead of six for 64. One multiply then sums the kept bits of
++/// the bytes below each byte, which is where that byte's bits go.
+ #[allow(clippy::inline_always)]
+ #[inline(always)]
+-fn pext_byte_lut(src: u64, mask: u64) -> u64 {
+-    let src_bytes = src.to_le_bytes();
+-    let mask_bytes = mask.to_le_bytes();
+-
+-    let mut result: u64 = 0;
+-    let mut bit_offset: u32 = 0;
+-
+-    // Unroll the byte loop for performance.
+-    macro_rules! process_byte {
+-        ($i:expr) => {
+-            let m = mask_bytes[$i];
+-            if m != 0 {
+-                let extracted = BYTE_PEXT_LUT[(m as usize) * 256 + (src_bytes[$i] as usize)];
+-                result |= (extracted as u64) << bit_offset;
+-                bit_offset += m.count_ones();
+-            }
+-        };
++fn compress_bytes(src: u64, mask: u64) -> u64 {
++    let mut packed = src & mask;
++    let mut dropped = !mask;
++    let mut shift = 1;
++    while shift < 8 {
++        // The bits that move down by `shift` this round: the parity of the dropped bits below
++        // each bit, in strides of `shift`.
++        let mut moves = dropped;
++        let mut step = shift;
++        while step < 8 {
++            moves ^= (moves << step) & repeat_byte(0xFF << step);
++            step <<= 1;
++        }
++        let moving = packed & moves;
++        packed ^= moving ^ ((moving >> shift) & repeat_byte(0xFF >> shift));
++        dropped &= !moves;
++        dropped ^= (dropped >> shift) & repeat_byte(0xFF >> shift);
++        shift <<= 1;
++    }
++    // Kept bits per byte (Hacker's Delight 5-1), then their sums over the bytes below.
++    let pairs = mask - ((mask >> 1) & repeat_byte(0x55));
++    let nibbles = (pairs & repeat_byte(0x33)) + ((pairs >> 2) & repeat_byte(0x33));
++    let kept = (nibbles + (nibbles >> 4)) & repeat_byte(0x0F);
++    let dest = kept.wrapping_mul(repeat_byte(1)) << 8;
++    let mut result = 0;
++    for byte in 0..8 {
++        result |= ((packed >> (8 * byte)) & 0xFF) << ((dest >> (8 * byte)) & 0xFF);
+     }
++    result
++}
+ 
+-    process_byte!(0);
+-    process_byte!(1);
+-    process_byte!(2);
+-    process_byte!(3);
+-    process_byte!(4);
+-    process_byte!(5);
+-    process_byte!(6);
+-    process_byte!(7);
++const fn repeat_byte(b: u8) -> u64 {
++    b as u64 * 0x0101_0101_0101_0101
++}
+ 
+-    let _ = bit_offset;
++/// SVE2 BEXT on the lowest lane: PEXT on aarch64, one word at a time.
++#[cfg(target_arch = "aarch64")]
++#[inline]
++#[target_feature(enable = "sve2,sve2-bitperm")]
++unsafe fn bext_sve2(src: u64, mask: u64) -> u64 {
++    let result: u64;
++    // SAFETY: registers only, and the caller checked SVE2 BITPERM support.
++    unsafe {
++        std::arch::asm!(
++            "fmov d0, {src}",
++            "fmov d1, {mask}",
++            "bext z0.d, z0.d, z1.d",
++            "fmov {result}, d0",
++            src = in(reg) src,
++            mask = in(reg) mask,
++            result = lateout(reg) result,
++            out("v0") _,
++            out("v1") _,
++            options(pure, nomem, nostack),
++        );
++    }
+     result
+ }
+ 
++/// BMI2 is there and its PEXT runs in hardware. Zen 1 and 2 (AMD family 17h, and Hygon's
++/// Zen-based family 18h) implement it in microcode, tens to hundreds of cycles depending on the
++/// mask, slower than [`pext_fallback`].
++#[cfg(target_arch = "x86_64")]
++fn has_fast_pext() -> bool {
++    use std::arch::x86_64::__cpuid;
++
++    if !std::arch::is_x86_feature_detected!("bmi2") {
++        return false;
++    }
++    let vendor = __cpuid(0);
++    let leaf1 = __cpuid(1).eax;
++    let base_family = (leaf1 >> 8) & 0xF;
++    let family = if base_family == 0xF {
++        base_family + ((leaf1 >> 20) & 0xFF)
++    } else {
++        base_family
++    };
++    // "AuthenticAMD" and "HygonGenuine", as cpuid spells them in ebx, edx, ecx
++    let amd = (vendor.ebx, vendor.edx, vendor.ecx) == (0x6874_7541, 0x6974_6E65, 0x444D_4163);
++    let hygon = (vendor.ebx, vendor.edx, vendor.ecx) == (0x6F67_7948, 0x6E65_476E, 0x656E_6975);
++    !(amd && family == 0x17 || hygon && family == 0x18)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use itertools::Itertools;
+@@ -377,17 +439,23 @@ mod tests {
+         );
+     }
+ 
+-    #[cfg(target_arch = "x86_64")]
+-    #[test]
+-    fn test_pext_fallback_matches_hardware() {
+-        use std::arch::x86_64::_pext_u64;
+-
+-        use super::pext_fallback;
+-
+-        if !std::arch::is_x86_feature_detected!("bmi2") {
+-            return;
++    /// The bits of `src` at the set bits of `mask`, packed at the bottom: PEXT by definition.
++    fn pext_reference(src: u64, mask: u64) -> u64 {
++        let mut result = 0;
++        let mut kept = 0;
++        for bit in 0..64 {
++            if (mask >> bit) & 1 == 1 {
++                result |= ((src >> bit) & 1) << kept;
++                kept += 1;
++            }
+         }
+-        let test_cases: Vec<(u64, u64)> = vec![
++        result
++    }
++
++    /// Fixed edge cases, then random words with masks from sparse to dense, so mask bytes are
++    /// often empty or full.
++    fn pext_cases() -> Vec<(u64, u64)> {
++        let mut cases = vec![
+             (0, 0),
+             (u64::MAX, u64::MAX),
+             (u64::MAX, 0),
+@@ -400,24 +468,79 @@ mod tests {
+             (u64::MAX, 1u64 << 63),
+             (0x8000_0000_0000_0001, 0x8000_0000_0000_0001),
+         ];
+-        for (src, mask) in test_cases {
+-            let hw = unsafe { _pext_u64(src, mask) };
+-            let sw = pext_fallback(src, mask);
+-            assert_eq!(hw, sw, "mismatch for src={src:#018x} mask={mask:#018x}");
+-        }
+         let mut rng = 0xDEAD_BEEF_u64;
+-        for _ in 0..1000 {
+-            rng ^= rng << 13;
+-            rng ^= rng >> 7;
+-            rng ^= rng << 17;
+-            let src = rng;
++        let mut next = move || {
+             rng ^= rng << 13;
+             rng ^= rng >> 7;
+             rng ^= rng << 17;
+-            let mask = rng;
+-            let hw = unsafe { _pext_u64(src, mask) };
+-            let sw = pext_fallback(src, mask);
+-            assert_eq!(hw, sw, "mismatch for src={src:#018x} mask={mask:#018x}");
++            rng
++        };
++        // Every single run, and pairs of runs, as masks of runs give them.
++        let run = |start: u32, len: u32| (u64::MAX >> (64 - len)) << start;
++        for start in 0..64 {
++            for len in 1..=64 - start {
++                cases.push((next(), run(start, len)));
++                let gap = (next() % 8) as u32 + 1;
++                if start + len + gap < 64 {
++                    let second = (next() % u64::from(64 - start - len - gap)) as u32 + 1;
++                    cases.push((next(), run(start, len) | run(start + len + gap, second)));
++                }
++            }
++        }
++        for _ in 0..2000 {
++            let src = next();
++            let mask = match next() % 4 {
++                0 => next() & next() & next(),
++                1 => next() | next() | next(),
++                _ => next(),
++            };
++            cases.push((src, mask));
++        }
++        cases
++    }
++
++    #[test]
++    fn pext_fallback_matches_reference() {
++        for (src, mask) in pext_cases() {
++            assert_eq!(
++                pext_fallback(src, mask),
++                pext_reference(src, mask),
++                "src={src:#018x} mask={mask:#018x}"
++            );
++        }
++    }
++
++    #[cfg(target_arch = "x86_64")]
++    #[test]
++    fn pext_bmi2_matches_reference() {
++        if !std::arch::is_x86_feature_detected!("bmi2") {
++            return;
++        }
++        for (src, mask) in pext_cases() {
++            // SAFETY: BMI2 was just detected.
++            let hw = unsafe { std::arch::x86_64::_pext_u64(src, mask) };
++            assert_eq!(
++                hw,
++                pext_reference(src, mask),
++                "src={src:#018x} mask={mask:#018x}"
++            );
++        }
++    }
++
++    #[cfg(target_arch = "aarch64")]
++    #[test]
++    fn bext_sve2_matches_reference() {
++        if !std::arch::is_aarch64_feature_detected!("sve2-bitperm") {
++            return;
++        }
++        for (src, mask) in pext_cases() {
++            // SAFETY: SVE2 BITPERM was just detected.
++            let hw = unsafe { bext_sve2(src, mask) };
++            assert_eq!(
++                hw,
++                pext_reference(src, mask),
++                "src={src:#018x} mask={mask:#018x}"
++            );
+         }
+     }
+ }
