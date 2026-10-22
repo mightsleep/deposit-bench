@@ -55,7 +55,7 @@ for t in $tunes; do
     bext=""
     [ -f "obj/$os-$t/bext.o" ] && bext="-DHAVE_BEXT obj/$os-$t/bext.o"
     # shellcheck disable=SC2086 # bext is a word list
-    cc -O2 -DTUNE="\"$t\"" bench.c obj/$os-$t/now.o obj/$os-$t/aes.o obj/$os-$t/stg.o \
+    cc -O2 -DTUNE="\"$t\"" bench.c vec.c obj/$os-$t/now.o obj/$os-$t/aes.o obj/$os-$t/stg.o \
       obj/$os-$t/aa.o obj/$os-$t/byte.o obj/$os-$t/nop.o $bext -o "$b"
   fi
 done

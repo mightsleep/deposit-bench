@@ -44,7 +44,7 @@ exe() { # os cpu: prebuilt bench, so the rented machine needs no compiler
     linux) tgt=aarch64-linux-musl bext="-DHAVE_BEXT $d/bext.o" ;;
   esac
   # shellcheck disable=SC2086 # bext is a word list
-  zig cc -target "$tgt" -O2 -DTUNE="\"$2\"" bench.c "$d/now.o" "$d/aes.o" "$d/stg.o" \
+  zig cc -target "$tgt" -O2 -DTUNE="\"$2\"" bench.c vec.c "$d/now.o" "$d/aes.o" "$d/stg.o" \
     "$d/aa.o" "$d/byte.o" "$d/nop.o" $bext -o "bin/$1-$2"
 }
 
