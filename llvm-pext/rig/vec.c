@@ -72,3 +72,50 @@ uint64_t hyb_pext64(uint64_t v, uint64_t m) {
   HSTAGE(1); HSTAGE(2); HSTAGE(4); HSTAGE(8); HSTAGE(16); HSTAGE(32);
   return x;
 }
+
+// pdep and the 32-bit forms of the hybrid. pdep computes the same stage masks
+// as pext and applies them in reverse, x = (x & ~mv) | ((x << k) & mv), then
+// clears what falls outside the mask. At 32 bits PMULL against all ones still
+// gives the prefix XOR in the low half; the bits above are dropped.
+#define HMASK(T, k, i)                 \
+  do {                                 \
+    uint64x1_t mp = pmul(mk, ones);    \
+    mk = bic(mk, mp);                  \
+    mv[i] = (T)to_gpr(mp) & m;         \
+    m = (m ^ mv[i]) | (mv[i] >> k);    \
+  } while (0)
+#define HAPPLY(k, i) x = (x & ~mv[i]) | ((x << k) & mv[i])
+
+uint64_t hyb_pdep64(uint64_t v, uint64_t m) {
+  uint64x1_t ones = vcreate_u64(~0ULL), mk = vcreate_u64(~m << 1);
+  uint64_t m0 = m, x = v, mv[6];
+  HMASK(uint64_t, 1, 0); HMASK(uint64_t, 2, 1); HMASK(uint64_t, 4, 2);
+  HMASK(uint64_t, 8, 3); HMASK(uint64_t, 16, 4); HMASK(uint64_t, 32, 5);
+  HAPPLY(32, 5); HAPPLY(16, 4); HAPPLY(8, 3); HAPPLY(4, 2); HAPPLY(2, 1); HAPPLY(1, 0);
+  return x & m0;
+}
+
+uint32_t hyb_pext32(uint32_t v, uint32_t m) {
+  uint64x1_t ones = vcreate_u64(~0ULL), mk = vcreate_u64((uint32_t)(~m << 1));
+  uint32_t x = v & m;
+#define H32(k)                                  \
+  do {                                          \
+    uint64x1_t mp = pmul(mk, ones);             \
+    mk = bic(mk, mp);                           \
+    uint32_t mv = (uint32_t)to_gpr(mp) & m;     \
+    m = (m ^ mv) | (mv >> k);                   \
+    uint32_t t = x & mv;                        \
+    x = (x ^ t) | (t >> k);                     \
+  } while (0)
+  H32(1); H32(2); H32(4); H32(8); H32(16);
+  return x;
+}
+
+uint32_t hyb_pdep32(uint32_t v, uint32_t m) {
+  uint64x1_t ones = vcreate_u64(~0ULL), mk = vcreate_u64((uint32_t)(~m << 1));
+  uint32_t m0 = m, x = v, mv[5];
+  HMASK(uint32_t, 1, 0); HMASK(uint32_t, 2, 1); HMASK(uint32_t, 4, 2);
+  HMASK(uint32_t, 8, 3); HMASK(uint32_t, 16, 4);
+  HAPPLY(16, 4); HAPPLY(8, 3); HAPPLY(4, 2); HAPPLY(2, 1); HAPPLY(1, 0);
+  return x & m0;
+}

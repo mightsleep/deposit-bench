@@ -17,7 +17,9 @@
 #define DECL(p) DECL1(p, 8) DECL1(p, 16) DECL1(p, 32) DECL1(p, 64)
 DECL(now) DECL(aes) DECL(stg) DECL(aa) DECL(byte) DECL(nop)
 // vec.c: the aes expansion without GPR <-> vector moves, a hybrid, and two probes
-uint64_t vec_pext64(uint64_t, uint64_t), hyb_pext64(uint64_t, uint64_t), rt6_pext64(uint64_t, uint64_t), pm6_pext64(uint64_t, uint64_t);
+uint64_t vec_pext64(uint64_t, uint64_t), hyb_pext64(uint64_t, uint64_t), hyb_pdep64(uint64_t, uint64_t);
+uint32_t hyb_pext32(uint32_t, uint32_t), hyb_pdep32(uint32_t, uint32_t);
+uint64_t rt6_pext64(uint64_t, uint64_t), pm6_pext64(uint64_t, uint64_t);
 #ifdef HAVE_BEXT
 DECL(bext)
 #endif
@@ -153,6 +155,8 @@ static long check(int bext) {
     CHECK(now) CHECK(aes) CHECK(stg) CHECK(aa) CHECK(byte)
     bad += vec_pext64(v, m) != ref_pext(v, m);
     bad += hyb_pext64(v, m) != ref_pext(v, m);
+    bad += hyb_pdep64(v, m) != ref_pdep(v, m);
+    bad += hyb_pext32(v, m32) != ref_pext((uint32_t)v, m32) || hyb_pdep32(v, m32) != (uint32_t)ref_pdep(v, m32);
 #ifdef HAVE_BEXT
     if (bext) { CHECK(bext) }
 #endif
@@ -203,7 +207,8 @@ static double med(double *a, int n) { qsort(a, n, sizeof *a, cmpd); return a[n /
 
 #define ROW(p, op, w) {#op, #p, w == 64 ? (F64)p##_##op##64 : 0, w == 32 ? (F32)p##_##op##32 : 0, w}
 #define ROWS(op, w) ROW(nop, op, w), ROW(now, op, w), ROW(aes, op, w), ROW(byte, op, w), ROW(stg, op, w), ROW(aa, op, w)
-#define ROW64(p) {"pext", #p, p##_pext64, 0, 64}
+#define ROW64(p, op) {#op, #p, p##_##op##64, 0, 64}
+#define ROW32(p, op) {#op, #p, 0, p##_##op##32, 32}
 
 int main(int argc, char **argv) {
   int bext = have_bext();
@@ -215,14 +220,15 @@ int main(int argc, char **argv) {
 
   Row all[] = {
     ROWS(pext, 64), ROWS(pdep, 64), ROWS(pext, 32), ROWS(pdep, 32),
-    ROW64(vec), ROW64(hyb), ROW64(rt6), ROW64(pm6),
+    ROW64(vec, pext), ROW64(hyb, pext), ROW64(hyb, pdep), ROW32(hyb, pext), ROW32(hyb, pdep),
+    ROW64(rt6, pext), ROW64(pm6, pext),
 #ifdef HAVE_BEXT
     ROW(bext, pext, 64), ROW(bext, pdep, 64), ROW(bext, pext, 32), ROW(bext, pdep, 32),
 #endif
   };
   int K = sizeof all / sizeof all[0];
-  if (!bext) K = 28; // the bext rows come last
-  enum { MAXK = 32 };
+  if (!bext) K = 31; // the bext rows come last
+  enum { MAXK = 40 };
   static double tc[MAXK][ROUNDS], lc[MAXK][ROUNDS], tn[MAXK][ROUNDS], ln[MAXK][ROUNDS], ti[MAXK][ROUNDS];
   // round robin with a rotating start, so no variant always runs after the same one
   for (int r = -WARM; r < ROUNDS; r++)
