@@ -16,8 +16,8 @@
 #define DECL1(p, w) uint##w##_t p##_pext##w(uint##w##_t, uint##w##_t), p##_pdep##w(uint##w##_t, uint##w##_t);
 #define DECL(p) DECL1(p, 8) DECL1(p, 16) DECL1(p, 32) DECL1(p, 64)
 DECL(now) DECL(aes) DECL(stg) DECL(aa) DECL(byte) DECL(nop)
-// vec.c: the aes expansion without GPR <-> vector moves, and its two halves
-uint64_t vec_pext64(uint64_t, uint64_t), rt6_pext64(uint64_t, uint64_t), pm6_pext64(uint64_t, uint64_t);
+// vec.c: the aes expansion without GPR <-> vector moves, a hybrid, and two probes
+uint64_t vec_pext64(uint64_t, uint64_t), hyb_pext64(uint64_t, uint64_t), rt6_pext64(uint64_t, uint64_t), pm6_pext64(uint64_t, uint64_t);
 #ifdef HAVE_BEXT
 DECL(bext)
 #endif
@@ -152,6 +152,7 @@ static long check(int bext) {
     uint16_t m16 = m; uint32_t m32 = m;
     CHECK(now) CHECK(aes) CHECK(stg) CHECK(aa) CHECK(byte)
     bad += vec_pext64(v, m) != ref_pext(v, m);
+    bad += hyb_pext64(v, m) != ref_pext(v, m);
 #ifdef HAVE_BEXT
     if (bext) { CHECK(bext) }
 #endif
@@ -214,13 +215,13 @@ int main(int argc, char **argv) {
 
   Row all[] = {
     ROWS(pext, 64), ROWS(pdep, 64), ROWS(pext, 32), ROWS(pdep, 32),
-    ROW64(vec), ROW64(rt6), ROW64(pm6),
+    ROW64(vec), ROW64(hyb), ROW64(rt6), ROW64(pm6),
 #ifdef HAVE_BEXT
     ROW(bext, pext, 64), ROW(bext, pdep, 64), ROW(bext, pext, 32), ROW(bext, pdep, 32),
 #endif
   };
   int K = sizeof all / sizeof all[0];
-  if (!bext) K = 27; // the bext rows come last
+  if (!bext) K = 28; // the bext rows come last
   enum { MAXK = 32 };
   static double tc[MAXK][ROUNDS], lc[MAXK][ROUNDS], tn[MAXK][ROUNDS], ln[MAXK][ROUNDS], ti[MAXK][ROUNDS];
   // round robin with a rotating start, so no variant always runs after the same one

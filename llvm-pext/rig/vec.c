@@ -41,3 +41,34 @@ uint64_t pm6_pext64(uint64_t v, uint64_t m) {
   for (int i = 0; i < 6; i++) a = pmul(a, b);
   return vget_lane_u64(a, 0);
 }
+
+// Hybrid: the mask chain (PMULL, BIC) stays in vector registers, the data
+// updates run in GPRs. One vector -> GPR move per stage, off the mask chain.
+static inline uint64x1_t bic(uint64x1_t a, uint64x1_t b) {
+  uint64x1_t r;
+  __asm__("bic %0.8b, %1.8b, %2.8b" : "=w"(r) : "w"(a), "w"(b));
+  return r;
+}
+
+static inline uint64_t to_gpr(uint64x1_t v) {
+  uint64_t r;
+  __asm__("fmov %x0, %d1" : "=r"(r) : "w"(v));
+  return r;
+}
+
+#define HSTAGE(k)                     \
+  do {                                \
+    uint64x1_t mp = pmul(mk, ones);   \
+    mk = bic(mk, mp);                 \
+    uint64_t mv = to_gpr(mp) & m;     \
+    m = (m ^ mv) | (mv >> k);         \
+    uint64_t t = x & mv;              \
+    x = (x ^ t) | (t >> k);           \
+  } while (0)
+
+uint64_t hyb_pext64(uint64_t v, uint64_t m) {
+  uint64x1_t ones = vcreate_u64(~0ULL), mk = vcreate_u64(~m << 1);
+  uint64_t x = v & m;
+  HSTAGE(1); HSTAGE(2); HSTAGE(4); HSTAGE(8); HSTAGE(16); HSTAGE(32);
+  return x;
+}
