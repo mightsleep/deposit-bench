@@ -6,13 +6,18 @@ name: llvm-pext-rig
 permissions:
   contents: read
 jobs:
-  # dry run of the rented-machine script: Cobalt 100 (N2) with perf, and the
-  # macOS VM, where kperf may well refuse; the bench says so
+  # The macOS runner is an M1 VM: kperf gives no cycles there, so the table is
+  # in ns. Three jobs land on different hosts; ratios that hold across them are
+  # usable, stg vs aa is the noise floor within one. N2 (Cobalt 100) has cycles.
   rig:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04-arm, macos-15]
+        runner: [macos-15]
+        run: [1, 2, 3]
+        include:
+        - runner: ubuntu-24.04-arm
+          run: 1
     runs-on: ${{ matrix.runner }}
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -22,7 +27,12 @@ jobs:
       run: |
         if [ "$(uname -s)" = Linux ]; then
           sudo sysctl kernel.perf_event_paranoid=2
-          ROUNDS=1 sh llvm-pext/rig/run.sh
+          ROUNDS=5 sh llvm-pext/rig/run.sh
         else
-          sudo ROUNDS=1 sh llvm-pext/rig/run.sh
+          sudo ROUNDS=5 sh llvm-pext/rig/run.sh
+          sudo chown -R "$(id -u)" llvm-pext/rig/results
         fi
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: rig-${{ matrix.runner }}-${{ matrix.run }}
+        path: llvm-pext/rig/results/
