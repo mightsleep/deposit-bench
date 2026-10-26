@@ -195,6 +195,107 @@ macro_rules! pr_kernels {
 pr_kernels!(pr32_div, pr32_rem, pr32_floor, DivisorI32, i32);
 pr_kernels!(pr64_div, pr64_rem, pr64_floor, DivisorI64, i64);
 
+/// aarch64: the PR's figure 5.1 with `sqdmulh`, which returns `(2 a b) >> 32` for 4 lanes, so
+/// one more shift right gives `MULSH(m', n)`, folded into `ssra`. LLVM writes `MULSH` as `smull`,
+/// `smull2` and `uzp2`. It saturates only for `MIN * MIN`, and `m'` is above `MIN` for every
+/// divisor that isn't a power of two. The remainder is devanbenz's, `n - q0 |d|`, with `mls`.
+#[cfg(target_arch = "aarch64")]
+mod sqd {
+    use super::DevI32;
+    use core::arch::aarch64::*;
+
+    #[inline(never)]
+    pub fn div(d: DevI32, a: &[i32]) -> Vec<i32> {
+        kernel::<false>(d, a)
+    }
+
+    #[inline(never)]
+    pub fn rem(d: DevI32, a: &[i32]) -> Vec<i32> {
+        kernel::<true>(d, a)
+    }
+
+    #[inline(always)]
+    fn kernel<const REM: bool>(d: DevI32, a: &[i32]) -> Vec<i32> {
+        let sign = d.divisor >> 31;
+        let magnitude = (d.divisor ^ sign) - sign;
+        let mut out: Vec<i32> = Vec::with_capacity(a.len());
+        let o = out.as_mut_ptr();
+        let full = a.len() / 4 * 4;
+        // SAFETY: NEON is part of aarch64, the loads read a[..full] and the stores write the
+        // first a.len() slots of the capacity
+        unsafe {
+            let m = vdupq_n_s32(d.multiplier);
+            let sh = vdupq_n_s32(-(d.shift as i32));
+            let s = vdupq_n_s32(sign);
+            let mag = vdupq_n_s32(magnitude);
+            for i in (0..full).step_by(4) {
+                let n = vld1q_s32(a.as_ptr().add(i));
+                let q = vshlq_s32(vsraq_n_s32::<1>(n, vqdmulhq_s32(n, m)), sh);
+                // q0 = q - (n >> 31), with a logical shift that adds 1 for a negative n
+                let q0 = vreinterpretq_s32_u32(vsraq_n_u32::<31>(
+                    vreinterpretq_u32_s32(q),
+                    vreinterpretq_u32_s32(n),
+                ));
+                let r = if REM {
+                    vmlsq_s32(n, q0, mag)
+                } else {
+                    vsubq_s32(veorq_s32(q0, s), s)
+                };
+                vst1q_s32(o.add(i), r);
+            }
+            for i in full..a.len() {
+                let n = a[i];
+                let high = ((d.multiplier as i64 * n as i64) >> 32) as i32;
+                let q0 = ((n + high) >> d.shift) - (n >> 31);
+                *o.add(i) = if REM {
+                    n - q0 * magnitude
+                } else {
+                    (q0 ^ sign) - sign
+                };
+            }
+            out.set_len(a.len());
+        }
+        out
+    }
+
+    /// Both kernels against `wrapping_div` / `wrapping_rem` at the ends of steps
+    pub fn check(rng: &mut super::Rng) -> u64 {
+        let mut ds: Vec<i32> = (3..3000).collect();
+        ds.extend([i32::MAX, i32::MAX - 1, 641, 6700417]);
+        ds.extend((0..5000).map(|_| (rng.next() >> (33 + rng.next() % 30)) as i32));
+        let mut checked = 0;
+        for d in ds {
+            for d in [d, d.wrapping_neg()] {
+                let ad = d.unsigned_abs();
+                if ad < 3 || ad.is_power_of_two() {
+                    continue;
+                }
+                let ad = ad as i64;
+                let last = (1i64 << 31) / ad;
+                let mut ks: Vec<i64> = (0..8).chain(last - 8..=last).collect();
+                ks.extend((0..16).map(|_| (rng.next() % (last as u64 + 1)) as i64));
+                let ns: Vec<i32> = ks
+                    .iter()
+                    .flat_map(|k| [k * ad, k * ad + ad - 1, -(k * ad), -(k * ad + ad - 1)])
+                    .filter(|n| (i32::MIN as i64..=i32::MAX as i64).contains(n))
+                    .map(|n| n as i32)
+                    .collect();
+                let dev = DevI32::new(d);
+                let (q, r) = (div(dev, &ns), rem(dev, &ns));
+                for (i, &n) in ns.iter().enumerate() {
+                    assert_eq!(
+                        (q[i], r[i]),
+                        (n.wrapping_div(d), n.wrapping_rem(d)),
+                        "sqd {n} / {d}"
+                    );
+                }
+                checked += ns.len() as u64;
+            }
+        }
+        checked
+    }
+}
+
 struct Rng(u64);
 
 impl Rng {
@@ -295,6 +396,11 @@ fn main() {
     );
     let c64 = check!(rng, i64, MagI64, DevI64, |_: i64, _: i64, _: (i64, i64)| {});
     println!("checked {c32} i32 and {c64} i64 dividends");
+    #[cfg(target_arch = "aarch64")]
+    println!(
+        "checked {} i32 dividends with sqdmulh",
+        sqd::check(&mut rng)
+    );
 
     let a32: Vec<i32> = (0..SIZE).map(|_| rng.next() as i32).collect();
     let a64: Vec<i64> = (0..SIZE).map(|_| rng.next() as i64).collect();
@@ -306,23 +412,23 @@ fn main() {
             black_box(MagI32::new(dv)),
             black_box(F64I32::new(dv)),
         );
-        run(
-            &format!("i32 / {dv}"),
-            &mut [
-                ("pr", Box::new(|| pr32_div(p, &a32))),
-                ("mag", Box::new(|| mag32_div(m, &a32))),
-                ("f64", Box::new(|| f64_div(f, &a32))),
-            ],
-        );
-        run(
-            &format!("i32 % {dv}"),
-            &mut [
-                ("pr", Box::new(|| pr32_rem(p, &a32))),
-                ("dev", Box::new(|| dev32_rem(v, &a32))),
-                ("mag", Box::new(|| mag32_rem(m, &a32))),
-                ("f64", Box::new(|| f64_rem(f, &a32))),
-            ],
-        );
+        let mut div: Vec<Kernel<'_, i32>> = vec![
+            ("pr", Box::new(|| pr32_div(p, &a32))),
+            ("mag", Box::new(|| mag32_div(m, &a32))),
+            ("f64", Box::new(|| f64_div(f, &a32))),
+        ];
+        #[cfg(target_arch = "aarch64")]
+        div.push(("sqd", Box::new(|| sqd::div(v, &a32))));
+        run(&format!("i32 / {dv}"), &mut div);
+        let mut rem: Vec<Kernel<'_, i32>> = vec![
+            ("pr", Box::new(|| pr32_rem(p, &a32))),
+            ("dev", Box::new(|| dev32_rem(v, &a32))),
+            ("mag", Box::new(|| mag32_rem(m, &a32))),
+            ("f64", Box::new(|| f64_rem(f, &a32))),
+        ];
+        #[cfg(target_arch = "aarch64")]
+        rem.push(("sqd", Box::new(|| sqd::rem(v, &a32))));
+        run(&format!("i32 % {dv}"), &mut rem);
         if dv > 0 {
             run(
                 &format!("i32 floor {dv}"),
