@@ -1,0 +1,15 @@
+[package]
+name = "divisor-callers"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# its own workspace, so it can sit inside another repo's tree
+[workspace]
+
+[dependencies]
+arrow-array = "60.0.0"
+arrow-schema = "60.0.0"
+
+[profile.release]
+debug = 1
