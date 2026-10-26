@@ -155,6 +155,29 @@ fn down(a: u32, p: u32, d: u32, n: u32) -> (u32, u32) {
     (q, n - q * d)
 }
 
+/// round down + 1 as a n + a in the 64-bit product: no saturation, exact for n = u32::MAX
+#[inline(always)]
+fn down2(a: u32, p: u32, d: u32, n: u32) -> (u32, u32) {
+    let q = (((a as u64 * n as u64 + a as u64) >> 32) as u32) >> p;
+    (q, n - q * d)
+}
+
+#[inline(never)]
+fn down2_div(d: Split, src: &[u32], dst: &mut [u32]) {
+    match d {
+        Split::Down { a, p, d } => dst.iter_mut().zip(src).for_each(move |(o, n)| *o = down2(a, p, d, *n).0),
+        other => split_div(other, src, dst),
+    }
+}
+
+#[inline(never)]
+fn down2_rem(d: Split, src: &[u32], dst: &mut [u32]) {
+    match d {
+        Split::Down { a, p, d } => dst.iter_mut().zip(src).for_each(move |(o, n)| *o = down2(a, p, d, *n).1),
+        other => split_rem(other, src, dst),
+    }
+}
+
 #[inline(never)]
 fn split_div(d: Split, src: &[u32], dst: &mut [u32]) {
     match d {
@@ -316,6 +339,13 @@ fn main() {
         assert_eq!(a, b, "pr % {d}");
         split_rem(s, &probe, &mut a);
         assert_eq!(a, b, "split % {d}");
+        down2_rem(s, &probe, &mut a);
+        op_rem(d, &probe, &mut b);
+        assert_eq!(a, b, "down2 % {d}");
+        down2_div(s, &probe, &mut a);
+        op_div(d, &probe, &mut b);
+        assert_eq!(a, b, "down2 / {d}");
+        op_rem(d, &probe, &mut b);
         let u = UpOrPr::new(d);
         uop_rem(u, &probe, &mut a);
         assert_eq!(a, b, "up-or-pr % {d}");
@@ -324,6 +354,11 @@ fn main() {
         assert_eq!(a, b, "up-or-pr / {d}");
 
         let (db, pb, sb, ub) = (black_box(d), black_box(p), black_box(s), black_box(u));
+        if let Split::Down { .. } = s {
+            let dv = time(&[Box::new(move |x, o| pr_div(pb, x, o)), Box::new(move |x, o| split_div(sb, x, o)), Box::new(move |x, o| down2_div(sb, x, o))], &src);
+            let rm = time(&[Box::new(move |x, o| pr_rem(pb, x, o)), Box::new(move |x, o| split_rem(sb, x, o)), Box::new(move |x, o| down2_rem(sb, x, o))], &src);
+            println!("  down {d}: div pr={:.3} sat={:.3} ({:.2}x) a*n+a={:.3} ({:.2}x) | rem pr={:.3} sat={:.3} ({:.2}x) a*n+a={:.3} ({:.2}x)", dv[0], dv[1], dv[0] / dv[1], dv[2], dv[0] / dv[2], rm[0], rm[1], rm[0] / rm[1], rm[2], rm[0] / rm[2]);
+        }
         let div = time(
             &[
                 Box::new(move |s, o| op_div(db, s, o)),
