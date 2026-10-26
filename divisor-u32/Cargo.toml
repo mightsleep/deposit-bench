@@ -1,0 +1,12 @@
+[package]
+name = "divisor-u32"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# its own workspace, so it can sit inside another repo's tree
+[workspace]
+
+[profile.release]
+debug = 1
+codegen-units = 1
